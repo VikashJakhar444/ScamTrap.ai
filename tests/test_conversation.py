@@ -267,8 +267,17 @@ def persona_check(prev_replies):
 
 
 def run_scenarios():
+    # Conversations, not islands: every casual turn shares ONE session and every
+    # scam pitch shares another, so persona/language/payload state actually
+    # carries across turns the way it does in a real chat. Multi-turn scripts
+    # still get a clean session each (their staging asserts start from zero).
+    last_group = None
     for sc in SCENARIOS:
-        fresh()
+        group = sc["name"] if "script" in sc else ("casual_chat" if sc.get("casual") else "scam_pitch")
+        if group != last_group:
+            fresh()
+            last_group = group
+            print(f"\n--- CONVERSATION: {group} ---", flush=True)
         print(f"\n--- SCENARIO: {sc['name']} ---", flush=True)
         turns = sc.get("script") or [sc]
         replies = []

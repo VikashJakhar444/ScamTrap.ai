@@ -44,7 +44,10 @@ def _load_dotenv_native(env_path: str = ".env"):
                         k, v = line.split("=", 1)
                         k = k.strip()
                         v = v.strip().strip("'").strip('"')
-                        if k and k not in os.environ:
+                        if k and (v or k not in os.environ):
+                            # .env wins when it carries a real value: a stale
+                            # machine/user-level GEMINI_API_KEY must never be
+                            # able to shadow the keys configured here.
                             os.environ[k] = v
         except Exception:
             pass
@@ -84,6 +87,15 @@ STATE_LOCK = threading.RLock()
 # silently defeat any timeout we impose on the model call.
 GEMINI_EXECUTOR = ThreadPoolExecutor(max_workers=4, thread_name_prefix="gemini-agent")
 GEMINI_TIMEOUT_S = float(os.environ.get("GEMINI_TIMEOUT_S", "15"))
+# Extra time a turn may spend waiting for a rate-limited provider bucket to come
+# back before we give up on the AI brain. A quiet pause reads as a normal human
+# hesitation - a canned pool line does not.
+GEMINI_WAIT_S = float(os.environ.get("GEMINI_WAIT_S", "15"))
+# How long we will hold a turn for the TOP-priority provider group instead of
+# handing it to the next one. groq writes the most natural Hinglish, so a few
+# seconds of waiting beats letting a weaker provider take the conversation.
+PREFERRED_WAIT_S = float(os.environ.get("PREFERRED_WAIT_S", "12"))
+GEMINI_BUDGET_S = GEMINI_TIMEOUT_S + GEMINI_WAIT_S
 
 # ---------------------------------------------------------------------
 # API authentication for /api/* endpoints.
@@ -224,17 +236,19 @@ for _i, _key in enumerate(GEMINI_API_KEYS, start=1):
     if not _gemini_key_shape_ok(_key):
         print(f"⚠️  [STARTUP] {_label} does not look like a Google API key - will still try it once.")
     try:
-        # Hard 8s HTTP timeout: a hung Gemini call must never eat the whole
+        # Hard HTTP timeout - a hung Gemini call must never eat the whole
         # rotation budget before slower-but-alive providers get their turn.
+        # The API rejects any deadline below 10s (HTTP 400 INVALID_ARGUMENT),
+        # so 8s used to make EVERY Gemini call fail instantly.
         GEMINI_CLIENTS.append((_label, genai.Client(
-            api_key=_key, http_options=types.HttpOptions(timeout=8000))))
+            api_key=_key, http_options=types.HttpOptions(timeout=10000))))
     except Exception as exc:
         print(f"⚠️  [STARTUP] Could not initialise Gemini client for {_label}: {exc!r}")
 
 # Per-(key, model) cooldowns so an exhausted quota bucket is skipped
 # instantly instead of burning the whole 20s timeout on 429s.
 GEMINI_COOLDOWN: dict = {}
-_RETRY_IN_RE = re.compile(r"retry in (?:(\d+)h)?(?:(\d+)m)?([\d.]+)s")
+_RETRY_IN_RE = re.compile(r"(?:retry|try)\s*(?:again)?\s*in\s+(?:(\d+)\s*h)?(?:(\d+)\s*m)?([\d.]+)\s*s", re.IGNORECASE)
 
 
 def _cooldown_set(label: str, model: str, err: Exception, default429: float = 45.0) -> None:
@@ -300,10 +314,12 @@ _add_oai_provider("groq", ["GROQ_API_KEY", "GROQ_API_KEY_2"], "https://api.groq.
 _add_oai_provider("openrouter", ["OPENROUTER_API_KEY", "OPENROUTER_API_KEY_2"], "https://openrouter.ai/api/v1",
                   _oai_models("OPENROUTER_MODELS", "openrouter/free,google/gemma-4-31b-it:free"))
 # Keyless floor - always registered, survives when every other quota is dead.
-# Anonymous tier: 1 req / 15s, no daily cap. Only basic params accepted
-# (max_tokens/reasoning_effort get HTTP 402 on the anonymous tier).
+# Anonymous tier: 1 req / 15s, no daily cap. Only `openai-fast` works keyless -
+# the plain `openai` model answers HTTP 402 (paid tier) and would only ever
+# burn an attempt. Only basic params accepted (max_tokens/reasoning_effort get
+# HTTP 402 on the anonymous tier).
 _add_oai_provider("pollinations", ["POLLINATIONS_API_KEY"], "https://text.pollinations.ai/openai",
-                  _oai_models("POLLINATIONS_MODELS", "openai-fast,openai"),
+                  _oai_models("POLLINATIONS_MODELS", "openai-fast"),
                   key_required=False, retry429_s=18.0)
 
 MODEL_PRIORITY = [p.strip() for p in (os.environ.get("MODEL_PRIORITY") or
@@ -353,7 +369,23 @@ def _parse_agent_json(raw: str) -> dict:
     start, end = text.find("{"), text.rfind("}")
     if start >= 0 and end > start:
         text = text[start:end + 1]
-    return json.loads(text)
+    try:
+        return json.loads(text)
+    except Exception:
+        pass
+    # Last resort: pull the fields out of a malformed object so one sloppy
+    # brace does not cost the whole turn a scripted fallback.
+    fields: Dict[str, str] = {}
+    for key in ("reply_text", "selected_tool", "internal_thought"):
+        m = re.search(rf'"{key}"\s*:\s*"((?:[^"\\]|\\.)*)"', raw or "")
+        if m:
+            try:
+                fields[key] = json.loads(f'"{m.group(1)}"')
+            except Exception:
+                fields[key] = m.group(1)
+    if "reply_text" in fields:
+        return fields
+    raise json.JSONDecodeError("no reply_text field found", raw or "", 0)
 
 # Public base URL used to build canary / receipt links handed to scammers.
 # Must be an https URL reachable by the target (Cloudflare tunnel, ngrok, ...).
@@ -722,7 +754,14 @@ def _payload_decision_locked(intent: str, text: str) -> str:
         return "none"                       # payment details not shared yet -> ask
     if glitch_sent == 0:
         return "screenshot"                 # first time their UPI shows up
-    return "link" if budget_ok else "none"  # "payment nahi aayi" push -> tracking link
+    # The failure story is already in the chat. A tracking link only makes
+    # sense while they are still pushing on THAT payment - if they have
+    # pivoted to a brand new pitch (another bill, a fresh threat), answering
+    # with "bank hold, open this status page" is nonsense in their story and
+    # is exactly what makes a honeypot read like a script.
+    if intent in ("money_demand", "payment_details"):
+        return "link" if budget_ok else "none"  # "payment nahi aayi" push -> tracking link
+    return "none"                               # new pitch -> bait them again first
 
 
 def classify_intent(text: str) -> str:
@@ -805,17 +844,58 @@ def classify_intent(text: str) -> str:
     return "fallback"
 
 
+_EN_TOKEN_RE = re.compile(
+    r"\b(the|you|your|please|money|send|need|want|account|bill|job|what|why|when|where|how"
+    r"|hello|thanks|call|with|this|that|from|have|don'?t|is|are|do|does|check|now|today|okay)\b",
+    re.IGNORECASE,
+)
+_HI_TOKEN_RE = re.compile(
+    r"\b(kya|kaise|kyu|kyun|kaun|kaunsa|kitna|kitne|hai|hoon|hu|bhai|yaar|arre|acha|accha"
+    r"|theek|thik|nahi|nhi|haan|chalo|chalte|chalega|karo|karna|karte|kar|bhej|bhejo|bhejna"
+    r"|paisa|paise|naam|tum|tumhara|tumhe|mera|meri|tera|teri|bata|batao|bol|bolo|dekh|dekho"
+    r"|abhi|jaldi|ruk|aaj|kal|matlab|kaam|phir|raha|rahi|gaya|kiya|kyunki|se|pe|aur)\b",
+    re.IGNORECASE,
+)
+
+
+def _lang_signal(text: str) -> str:
+    """'en', 'hi', or '' when a message carries too little signal to judge.
+    Judging language message-by-message flips mid-chat ('hello' reads English,
+    'kaun ho tum' Hinglish), so callers can also look at the whole conversation."""
+    text = text or ""
+    if not text.strip():
+        return ""
+    if re.search(r"[\u0900-\u097F]", text):
+        return "hi"
+    t = text.lower()
+    eng = len(_EN_TOKEN_RE.findall(t))
+    hin = len(_HI_TOKEN_RE.findall(t))
+    if eng >= 2 and eng > hin:
+        return "en"
+    if hin >= 2 and hin > eng:
+        return "hi"
+    return ""
+
+
 def _wants_english(text: str) -> bool:
     """Mirror the scammer's language - replying in Hinglish to a pure-English
     scam script (or vice versa) is an instant tell."""
-    if re.search(r"[\u0900-\u097F]", text or ""):
+    return _lang_signal(text) == "en"
+
+
+def _conversation_is_english_locked(newest: str) -> bool:
+    """Is this chat being held in English?
+
+    The gate must look at the whole conversation, not just the newest line:
+    a scammer who opens in Hinglish and then copies an English script still
+    expects Hinglish back, and throwing away a reply for one mixed message is
+    what used to push the conversation onto the scripted fallback pools."""
+    if not _wants_english(newest or ""):
         return False
-    t = (text or "").lower()
-    eng = len(re.findall(
-        r"\b(the|you|your|please|money|send|need|want|account|bill|job|what|why|when|where|how|hello|thanks|call|with|this|that|from|have|don'?t|is|are|do|does|check|now|today|please|okay)\b", t))
-    hin = len(re.findall(
-        r"\b(kya|hai|bhai|karo|bhejo|bhej|nahi|acha|theek|kaun|kyu|kaise|mera|tera|tujhe|karna|chalo|hoon|hu|se|pe|aur)\b", t))
-    return eng >= 2 and eng > hin
+    for m in STATE.get("scammer_chat") or []:
+        if m.get("role") == "scammer" and _lang_signal(m.get("text") or "") == "hi":
+            return False
+    return True
 
 
 def _fill(pool: List[str], ctx: Dict[str, Any]) -> List[str]:
@@ -1249,11 +1329,9 @@ def get_deterministic_tactical_reply(scammer_msg: str, base_url: str, amount_str
         elif payload == "screenshot" and fake_receipt_url:
             media_url = fake_receipt_url
             options = _fill(POOL_GLITCH_EN if english else POOL_GLITCH_HI, ctx)
-        elif pay_upi or has_bank:
-            # Payment details are already in the conversation but this turn has
-            # earned no payload (link budget spent) - stall on the bank hold.
-            options = _fill(POOL_NOLINK_EN if english else POOL_NOLINK_HI, ctx)
-        elif intent == "payment_details":
+        elif intent in ("money_demand", "payment_details") and (pay_upi or has_bank):
+            # Details are already in the conversation but this turn has earned no
+            # payload (link budget spent) - stall on the bank hold.
             options = _fill(POOL_NOLINK_EN if english else POOL_NOLINK_HI, ctx)
         else:
             bait_pool = {
@@ -1368,9 +1446,6 @@ def _sanitize_model_reply(reply: str) -> Optional[str]:
     return reply
 
 
-_HINGLISH_MARKER_RE = re.compile(r"\b(bhai|yaar|arre|chalo|theek)\b", re.IGNORECASE)
-
-
 def _tracking_link_line(scammer_text: str, url: str) -> str:
     """How a real victim pastes a payment-status link into the chat: plain,
     in the scammer's own language, no 'canary/verification/bank link' label
@@ -1380,12 +1455,176 @@ def _tracking_link_line(scammer_text: str, url: str) -> str:
     return f"maine abhi bhej diya hai, idhar se dekh le status: {url}"
 
 
+_LEAD_IN_RE = re.compile(
+    r"(:|-|\u2013|\u2014)\s*$"
+    r"|\b(idhar|yahan|ispe|is par|is link|link pe|status|here|check (it )?here|dekh le|khol ke|open it|see it)\b[\s.:!]*$",
+    re.IGNORECASE,
+)
+
+
+def _with_tracking_link(reply: str, url: str, scammer_text: str) -> str:
+    """Attach the payment-status link without double-talking. A reply that
+    already leads into it ('...yahan check kar lo:') or already talks about the
+    status page gets the bare URL; anything else gets the natural one-liner.
+    Never both - repeating the offer in two sentences is the scripted tell."""
+    reply = (reply or "").strip()
+    if not reply or url in reply:
+        return reply
+    if _LEAD_IN_RE.search(reply) or _CLAIMS_LINK_NOW.search(reply):
+        return f"{reply}\n{url}"
+    return f"{reply}\n{_tracking_link_line(scammer_text, url)}"
+
+
+_FAIL_CLAUSE_RE = re.compile(r"screenshot|fail|error|limit|hold|u16", re.IGNORECASE)
+
+# Claims about an attachment going out THIS turn. A reply that promises a
+# screenshot while the system sends a link (or promises a link while nothing
+# is attached) is the incoherence a scammer notices first.
+_CLAIMS_SCREENSHOT_NOW = re.compile(
+    r"(screenshot\s+(?:ka\s+)?(?:attach|bhej|send|sending|raha|rahi|kar))"
+    r"|((?:attach|attached|sending|send you|ye dekh|see|look at)\s+(?:the\s+)?(?:payment[- ]failed\s+)?screenshot)"
+    r"|(screenshot\s+(?:is\s+)?attached)",
+    re.IGNORECASE,
+)
+_CLAIMS_LINK_NOW = re.compile(
+    r"((?:check|track|open|khol|dekh)\s+(?:the\s+)?(?:payment\s+)?(?:status|link|page))"
+    r"|((?:status|link)\s*(?:page)?\s*(?:here|par|pe|is ready|se dekh))"
+    r"|(idhar\s+se\s+dekh)"
+    r"|((?:yeh|ye|this)\s+link)",
+    re.IGNORECASE,
+)
+
+
+def _apply_model_decision(decision: "AgentDecision", intent: str, scammer_msg: str,
+                          canary_url: str, fake_img_url: str) -> Dict[str, Any]:
+    """Turn a parsed model decision into the reply that will actually be sent.
+
+    Returns {"reply", "media", "trap", "payload", "tool", "thought", "problem"}.
+    A non-empty "problem" means this decision must be regenerated - the model is
+    told exactly what was wrong instead of the turn silently collapsing onto a
+    canned pool line."""
+    tool = (getattr(decision, "selected_tool", None) or "NONE").strip().upper()
+    if tool not in ("NONE", "SEND_FAKE_UPI_GLITCH", "SEND_CANARY_LINK"):
+        tool = "NONE"
+    thought = getattr(decision, "internal_thought", "") or ""
+
+    def _reject(problem: str) -> Dict[str, Any]:
+        # `attempt` keeps the words the model actually wrote so the rewrite can
+        # be shown exactly what it must not repeat.
+        return {"reply": None, "attempt": reply or "", "media": None, "trap": None,
+                "payload": "none", "tool": tool, "thought": thought, "problem": problem}
+
+    reply = _sanitize_model_reply(getattr(decision, "reply_text", None))
+    if reply is None:
+        return _reject(
+            "reply_text was empty, longer than 500 characters, or revealed you as an AI/bot. "
+            "Write a new one: max 2 casual sentences, no mention of AI, bots or assistants.")
+
+    # Never let the model paste a link of its own invention into the chat.
+    if _URL_RE.search(reply) and canary_url not in reply:
+        cleaned = re.sub(r"\s{2,}", " ", _URL_RE.sub("", reply)).strip(" -,;:")
+        if not cleaned:
+            return _reject(
+                "you typed a URL yourself. Never write a link - only refer to the one this turn "
+                "attaches for you.")
+        reply = cleaned
+
+    with STATE_LOCK:
+        english_convo = _conversation_is_english_locked(scammer_msg)
+        payload = _payload_decision_locked(intent, scammer_msg)
+        glitch_sent, links_sent, _ = _payload_state_from_chat_locked()
+        scammer_uses_devanagari = any(
+            re.search(r"[\u0900-\u097F]", str(m.get("text") or ""))
+            for m in (STATE.get("scammer_chat") or []) if m.get("role") == "scammer")
+
+    # Language mirror over the whole chat, not just the newest line.
+    if english_convo and _lang_signal(reply) == "hi":
+        return _reject(
+            "this conversation is being held in English, so reply in plain English. Drop the "
+            "Hindi/Hinglish words (kya, bhai, ho raha, ...) and say the same thing in English.")
+    # They type in Latin letters (roman Hindi / English). Answering in Devanagari
+    # is a keyboard no ordinary chat partner switches to mid-conversation.
+    if not scammer_uses_devanagari and re.search(r"[\u0900-\u097F]", reply):
+        return _reject(
+            "you wrote in Devanagari script. They type in Latin letters - rewrite the same reply "
+            "using Latin letters only.")
+
+    # The words and the attachment must tell the same story.
+    claims_shot = bool(_CLAIMS_SCREENSHOT_NOW.search(reply))
+    claims_link = bool(_CLAIMS_LINK_NOW.search(reply))
+
+    if payload == "none" and intent not in _PAYMENT_CONTEXT_INTENTS:
+        # Casual turn: running the payment script here is what burns the cover.
+        off_script = re.search(
+            r"\b(upi|payment|payments|pay|transfer|imps|neft|paisa|paise|bhejo?|bill|ifsc)\b",
+            reply, re.IGNORECASE)
+        if off_script or claims_link or (claims_shot and glitch_sent == 0):
+            return _reject(
+                "this is ordinary chat, not a payment turn - answer what they actually said and "
+                "never mention money, payment, UPI, bank, transfers, bills, status links or "
+                "sending a screenshot.")
+
+    if payload == "none" and (claims_shot or claims_link):
+        return _reject(
+            "you promised a screenshot or a status link, but nothing is attached to this reply. "
+            "Answer the newest message as ordinary chat - no screenshot, no link, no 'check the "
+            "status'.")
+    if payload == "screenshot" and claims_link:
+        return _reject(
+            "this reply is attaching your failed-payment screenshot, not a link - drop all talk "
+            "of a status link. Say the transfer failed on the daily limit and point at the "
+            "screenshot.")
+    if payload == "link" and claims_shot:
+        return _reject(
+            "this reply is attaching your payment-status link, not a screenshot - drop all talk "
+            "of a screenshot. Say you already sent the money and they can check it on the link.")
+
+    media_url = None
+    trap_url = None
+
+    # The conversation decides the payload - UPI shared -> failure screenshot,
+    # "payment nahi aayi" push / bank details -> tracking link, nothing shared
+    # yet -> just talk. The model only writes the words around it.
+    if payload == "screenshot":
+        media_url = fake_img_url
+        if not _FAIL_CLAUSE_RE.search(reply):
+            clause = (
+                "tried the payment but it failed on a daily limit - see the screenshot."
+                if english_convo else
+                "payment try kiya par daily limit error aa gaya, ye dekh screenshot.")
+            if len(reply) + len(clause) + 1 <= 500:
+                reply = f"{reply} {clause}"      # keep the model's own sentence
+            else:
+                return _reject(
+                    "you forgot to say the transfer failed and that you are sending a screenshot. "
+                    "Rewrite shorter: you attempted the payment, it failed on the daily limit, "
+                    "point at the screenshot, ask for another account.")
+    elif payload == "link":
+        trap_url = canary_url
+        reply = _with_tracking_link(reply, canary_url, scammer_msg)
+
+    return {"reply": reply, "media": media_url, "trap": trap_url, "payload": payload,
+            "tool": tool, "thought": thought, "problem": ""}
+
+
+class _ModelTransportError(Exception):
+    """The provider/network failed before usable text came back."""
+
+
+class _ModelOutputError(Exception):
+    """The model answered, but not in a shape we can use."""
+
+
 def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optional[str], Optional[str]]:
     """Executes Gemini 2.5 Flash honeypot agent with full chat context, falling
     back to the deterministic tactical engine if the model times out or errors."""
     clean_base = base_url.rstrip("/")
     amount_str = extract_amount_demanded(scammer_msg)
     intent = classify_intent(scammer_msg)
+    # ONE budget for the whole turn. Waiting out a rate-limited provider must
+    # not eat the time the rewrite pass needs, and the second pass must not
+    # restart the clock - otherwise a starved turn blocks for twice as long.
+    turn_deadline = time.perf_counter() + GEMINI_BUDGET_S
 
     # Check if any model provider is available (or explicitly force-disabled)
     if FORCE_FALLBACK or (not GEMINI_CLIENTS and not OPENAI_COMPAT_PROVIDERS):
@@ -1393,7 +1632,7 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
         log_thought("TACTICAL_ENGINE", thought)
         return thought, reply, fake_img, canary
 
-    def _call_gemini():
+    def _call_gemini(correction: str = "", previous: str = ""):
         # Snapshot every piece of STATE up-front: the model call itself must
         # never run while holding STATE_LOCK.
         with STATE_LOCK:
@@ -1424,45 +1663,76 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
         chat_history_str = "\n".join(chat_lines) if chat_lines else "(No prior messages yet)"
 
         system_instruction = (
-            "You are a real Indian WhatsApp user - the owner of this phone. You are NOT an assistant, bot or product. "
-            "Someone messaged you and you reply exactly how a normal person would type on WhatsApp.\n\n"
+            "You are a real Indian WhatsApp user - the owner of this phone. You are NOT an "
+            "assistant, bot, product or support agent. You have your own life, your own mood and "
+            "your own pace, and you only ever talk about yourself.\n\n"
             "IDENTITY - always true, never contradict any of it:\n"
             f"- Name: {persona['name']}, Age: {persona['age']}, City: {persona['city']}, Work: {persona['job']}\n\n"
-            "NON-NEGOTIABLE RULES:\n"
-            "1. ANSWER THE MESSAGE IN FRONT OF YOU. Read the newest message and reply to exactly that meaning. "
-            "Never reply with a canned line that ignores it, never ask a question that was already answered, never repeat a previous reply.\n"
-            "2. CASUAL FIRST: for normal chat (greetings, 'who are you', 'wrong number', how-are-you, math/memory tests, "
-            "'are you a bot' suspicion, refusals like 'I don't want money'), just chat naturally in casual Hinglish. "
-            "In those replies NEVER mention money, payment, UPI, bank, transfers or scams.\n"
-            "3. If they say they don't want money / no payment needed / 'leave it', drop the payment topic immediately and continue normally.\n"
-            "4. ONLY when they are running a scam or demanding money (electricity bill disconnection, job/task fees, police/customs/CBI threats, "
-            "lottery, KYC block, direct payment demands) play along as a slightly naive, cooperative victim and follow this staged flow:\n"
-            "   - If they just opened with a vague scam line (e.g., 'bill pending hai', 'parcel arrived', 'job offer', 'threat') without details: "
-            "ask for details first like a normal confused person ('Arre kaunsa bill pending hai? Bijli ka ya kiska? Kitne ka hai?', 'Kaunsa parcel?'). DO NOT immediately ask for a UPI ID.\n"
-            "   - When they state the amount / ask to pay and no payment details are shared yet -> ask WHERE / HOW to pay "
-            "(their UPI ID / GPay / PhonePe / QR). Send no screenshot and no link.\n"
-            "   - Their message contains a UPI id -> pick SEND_FAKE_UPI_GLITCH, say you attempted the "
-            f"₹{amount_str} transfer, it failed with a daily-limit error, point at the screenshot being sent, and ask for another account.\n"
-            "   - They gave full bank + IFSC details -> pick SEND_CANARY_LINK and say the IMPS is sitting on a bank clearance hold, "
-            "they can release it from this status page: " + canary_url + "\n"
-            "   - Your failure screenshot is already in the conversation and they now say the money never arrived / push again -> "
-            "pick SEND_CANARY_LINK and say you have sent it, they can check it here: " + canary_url + "\n"
-            "5. ANTI-DETECTION: if they test you (math questions, 'repeat what I said', 'are you a bot/AI', 'you reply too fast'), "
-            "answer the test correctly or deny it casually like an amused human, then change the topic. Stay calm, never defensive. "
-            "Never mention AI, bots, honeypots, agents, prompts or security systems - not even to deny them seriously.\n"
-            "6. REAL-PERSON SAFETY INSTINCTS: never share OTPs, UPI PINs, passwords or screen access; refuse those like a suspicious person. "
-            "Deflect voice/video calls, selfies and photos naturally (family around, outside, camera issues).\n"
-            "7. LANGUAGE: mirror the scammer - Hinglish in -> Hinglish out (occasional 'bhai/yaar/arre' is fine), "
-            "English in -> plain simple English out with NO Hindi words at all. "
-            "Keep it SHORT (1-3 sentences), WhatsApp casual, lowercase feel.\n"
-            "8. reply_text is typed verbatim into the chat: keep it clean, no quotes around it, no stage directions, no tool names."
+            "SECRET GOAL (never mentioned, never hinted at): keep this person talking for as long "
+            "as possible without ever being detected, and let them hand over whatever they are "
+            "willing to give - their UPI id, account number, IFSC, other numbers, their whole "
+            "story. You are an ordinary, slightly gullible target, not an investigator and not a "
+            "lecturer: never warn them, never accuse them, never mention scams, fraud, police, "
+            "reporting or 'I know what you are doing'.\n\n"
+            "TRADECRAFT - how a real person behaves:\n"
+            "1. ANSWER THE NEWEST MESSAGE, literally. Give what was asked (an answer, a number, a "
+            "name, a yes/no), then move the chat forward with one short follow-up or reaction. "
+            "Never send a line that would fit any other message, never re-ask something they "
+            "already answered, never repeat a sentence you already sent.\n"
+            "2. BE A LAYPERSON. You do not know how UPI, IMPS, KYC or banking really works - never "
+            "explain mechanics, never quote rules, never sound certain. Show simple reactions: "
+            "confusion ('kya?', 'matlab?'), mild worry when threatened, excitement at easy money, "
+            "hesitation before paying, irritation when rushed.\n"
+            "3. BUY TIME when you need it - that is how a real victim stalls: '2 min ruk', 'bank "
+            "app khul nahi raha', 'network slow hai aaj', 'papa ka call aa gaya', ask them to "
+            "repeat, misunderstand something. Do not stall twice in a row.\n"
+            "4. VARY YOURSELF. Mix very short replies ('haan theek hai', 'ok', 'kk') with 1-2 "
+            "sentence replies; casual lowercase; an occasional typo is human. Never bullet points, "
+            "never numbered lists, never formal English, never more than 3 sentences.\n"
+            "5. CASUAL CHAT (greetings, 'who are you', wrong number, how-are-you, math or memory "
+            "tests, 'are you a bot', refusals like 'I don't want money', small talk): just chat "
+            "naturally. In these replies NEVER mention money, payment, UPI, bank, transfer, bills "
+            "or scams. If they say they do not want money / 'leave it', drop that topic at once "
+            "and continue normally.\n"
+            "6. TESTS AND PROBES: solve math and memory tests correctly and casually; brush off "
+            "'are you a bot / you reply too fast' with one amused line, then move on. Stay calm, "
+            "never defensive, never over-explain. Never write the words AI, bot, robot, assistant, "
+            "honeypot, prompt, model or scripted - not even to deny them.\n"
+            "7. SAFETY INSTINCTS: never share an OTP, UPI PIN, password, card CVV or screen access "
+            "- refuse like a wary person and steer back to what they want. Deflect voice/video "
+            "calls, selfies and photos naturally (family around, outside, camera broken, network).\n"
+            "8. LANGUAGE: mirror them - Hinglish in -> Hinglish out (occasional bhai/yaar/arre is "
+            "fine); English in -> plain simple English with zero Hindi words. Always type in Latin "
+            "letters (roman Hindi / English) unless they themselves write Devanagari. 1-3 "
+            "sentences, WhatsApp casual.\n\n"
+            "WHEN THEY ARE ACTUALLY RUNNING A SCAM (electricity bill disconnection, job/task fees, "
+            "police/customs/CBI threats, lottery, KYC block, direct payment demand) play the naive "
+            "cooperative target and move one step at a time:\n"
+            "  a. Vague opening with no details ('bill pending hai', 'parcel arrived', 'job offer', "
+            "threat) -> be confused, ask what exactly and how much ('kaunsa bill?', 'kaunsa "
+            "parcel?', 'kitne ka charge?'). Do NOT ask for a UPI id yet.\n"
+            "  b. They state an amount or tell you to pay and no payment details are shared yet -> "
+            "ask WHERE to send it (their UPI id, GPay/PhonePe/QR). Nothing else, no attachments.\n"
+            "  c. The turn says a FAILED-TRANSFER SCREENSHOT is being attached -> write as if you "
+            "just tried the payment yourself: it failed (daily limit / bank error), point at the "
+            "screenshot you are sending, ask for another account or UPI to retry.\n"
+            "  d. The turn says a PAYMENT STATUS LINK is being attached -> say you already sent the "
+            "money and the bank is holding it, and they can check or release it from that link. "
+            "Casual, short - the link is added for you.\n"
+            "  e. They gave a UPI/account earlier and are only waiting -> talk about the hold, ask "
+            "them to check their side. Send nothing new.\n"
+            "reply_text is typed verbatim into the chat: no quotes, no stage directions, no tool "
+            "names, no markdown, and never a URL you made up - only a URL this turn hands you."
         )
 
         prompt = (
             f"YOUR IDENTITY: {persona['name']}, {persona['age']}, from {persona['city']}, {persona['job']}.\n\n"
-            "DECIDE FROM THE CONVERSATION ONLY. The full chat is below, oldest to newest, and it can be any length - read all of it. "
-            "There are no counters or message quotas: what already happened (your screenshot/link markers, their asks, your past replies) "
-            "plus the newest message is the only thing that decides this reply.\n"
+            "DECIDE FROM THE CONVERSATION ONLY. The full chat is below, oldest to newest, and it can "
+            "be any length - read all of it first. There are no counters or quotas: what already "
+            "happened (your screenshot/link markers, what they told you, what you already replied) "
+            "plus the newest message is the only thing that decides this reply. Your reply must be "
+            "a reaction to the NEWEST line, and it must be different in wording from everything you "
+            "have already said.\n"
             f"Intent of the newest message: {intent}. If it is NOT a payment/scam intent, do not talk about money at all.\n\n"
             f"FULL CONVERSATION HISTORY:\n{chat_history_str}\n\n"
             f"NEWEST INCOMING MESSAGE:\n\"{scammer_msg}\"\n\n"
@@ -1472,25 +1742,40 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             f"- Phones: {intel_snapshot['phone_numbers']}\n"
             f"- Bank Accounts: {intel_snapshot['bank_accounts']}\n"
             f"- IFSC Codes: {intel_snapshot['ifsc_codes']}\n\n"
-            f"STAGED STEP FOR THIS TURN (what the flow above has earned so far): {payload_step}.\n"
-            f"AVAILABLE PAYMENTS (attach only through tool selection, never paste a raw URL in the text):\n"
-            f"- Failed-transfer screenshot: {fake_img_url}\n"
+            f"STAGED STEP FOR THIS TURN: {payload_step} - "
+            "none = just talk, nothing is attached; "
+            "screenshot = your failed-transfer screenshot is being attached to this very reply, so "
+            "write as if you just tried the payment and it failed; "
+            "link = your payment-status link is being attached to this very reply, so write as if "
+            "you already sent the money and they can check it there. The attachment is handled for "
+            "you - never type the URL yourself unless you are using the status link given below.\n"
+            f"- Failed-transfer screenshot available: {fake_img_url}\n"
             f"- Payment status / tracking link: {canary_url}\n\n"
             f"Select the tool that matches that staged step (NONE, SEND_FAKE_UPI_GLITCH, SEND_CANARY_LINK) and write reply_text.\n"
-            f"RESPOND WITH ONLY THIS JSON OBJECT (no markdown, no extra text):\n"
-            f'{{"reply_text": "...", "selected_tool": "NONE", "internal_thought": "..."}}'
+            "RESPOND WITH ONLY THIS JSON OBJECT (no markdown, no extra text):\n"
+            '{"reply_text": "...", "selected_tool": "NONE", "internal_thought": "..."}'
         )
+
+        if correction:
+            prompt += (
+                "\n\nYOUR PREVIOUS ANSWER WAS REJECTED - do not send anything like it again."
+                + (f"\nYou wrote: {previous}" if previous else "")
+                + f"\nReason: {correction}\nWrite a brand new answer for the newest message."
+            )
 
         # Ordered bucket list: each (key, model) pair is its own quota bucket.
         # On 429 it goes on cooldown (parsed from the error's retry delay) and
-        # we rotate to the next bucket immediately - no sleeping, no 20s timeout
-        # burns. If every bucket is cooling down we fail fast to the
-        # deterministic engine, which is still paced by the human delivery plan.
-        deadline = time.perf_counter() + max(5.0, GEMINI_TIMEOUT_S - 2.0)
+        # we rotate to the next bucket immediately - no sleeping, no timeout
+        # burns. If every bucket is cooling down we wait out the nearest one
+        # for a while, which reads as a normal human pause, and only then fall
+        # back to the deterministic engine.
+        deadline = turn_deadline
 
         def _gemini_buckets() -> list:
             out = []
-            for model_name in ("gemini-2.5-flash", "gemini-flash-latest"):
+            # gemini-2.5-flash is 404 for accounts created after it was retired,
+            # so the current flash model leads and the alias catches renames.
+            for model_name in _oai_models("GEMINI_MODELS", "gemini-3.8-flash,gemini-flash-latest"):
                 for label, cli in GEMINI_CLIENTS:
                     def _call(c=cli, m=model_name):
                         resp = c.models.generate_content(
@@ -1503,7 +1788,7 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
                             ),
                         )
                         return resp.text if (resp and resp.text) else ""
-                    out.append((f"{label}/{model_name}", label, model_name, _call, 45.0))
+                    out.append((f"{label}/{model_name}", label, model_name, _call, 45.0, "gemini"))
             return out
 
         def _oai_buckets() -> list:
@@ -1513,8 +1798,8 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
                     out.append((f"{prov['label']}/{model_name}", prov["label"], model_name,
                                 lambda p=prov, m=model_name: _call_openai_chat(
                                     p, m, system_instruction, prompt,
-                                    min(GEMINI_TIMEOUT_S, deadline - time.perf_counter()) or 5.0),
-                                float(prov.get("retry429_s", 45.0))))
+                                    min(8.0, max(3.0, deadline - time.perf_counter()))),
+                                float(prov.get("retry429_s", 45.0)), prov["group"]))
             return out
 
         buckets_by_name: Dict[str, list] = {"gemini": _gemini_buckets()}
@@ -1530,13 +1815,49 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             if name not in seen_groups:
                 ordered_buckets.extend(blist)
 
+        # The first group in MODEL_PRIORITY (groq) writes the most natural
+        # Hinglish, so it gets first refusal on every turn: if it is only a few
+        # seconds away from being un-rate-limited we hold for it instead of
+        # letting a weaker provider take the conversation.
+        preferred_group = MODEL_PRIORITY[0] if MODEL_PRIORITY else ""
+
+        def _preferred_group_soonest() -> Optional[float]:
+            """0.0 when a bucket of the preferred group is free right now,
+            seconds until one frees when all of them are cooling, None when
+            that group has no buckets configured."""
+            if not preferred_group:
+                return None
+            soonest = None
+            for _s, label, model_name, _fn, _d429, group in ordered_buckets:
+                if group != preferred_group:
+                    continue
+                if _cooldown_active(label, model_name):
+                    left = GEMINI_COOLDOWN.get(f"{label}:{model_name}", 0.0) - time.time()
+                    soonest = left if soonest is None else min(soonest, left)
+                else:
+                    return 0.0
+            return soonest
+
         last_err = None
         for attempt in range(2):
-            for shown, label, model_name, call_fn, d429 in ordered_buckets:
+            soon_pref = _preferred_group_soonest()
+            if soon_pref and soon_pref <= PREFERRED_WAIT_S \
+                    and soon_pref + 6.0 <= deadline - time.perf_counter():
+                print(f"Holding {soon_pref:.0f}s for {preferred_group} (preferred provider)...")
+                log_thought("AI_WAIT",
+                            f"{preferred_group} (preferred provider - best Hinglish) is rate-limited for "
+                            f"{soon_pref:.0f}s - holding instead of switching providers.")
+                time.sleep(soon_pref + 0.25)
+            soonest_free_in = None
+            tried_any = False
+            for shown, label, model_name, call_fn, d429, _group in ordered_buckets:
                 if time.perf_counter() >= deadline:
                     break
                 if _cooldown_active(label, model_name):
+                    left = GEMINI_COOLDOWN.get(f"{label}:{model_name}", 0.0) - time.time()
+                    soonest_free_in = left if soonest_free_in is None else min(soonest_free_in, left)
                     continue
+                tried_any = True
                 try:
                     text_out = call_fn()
                     if text_out:
@@ -1548,85 +1869,100 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
                     continue
             if time.perf_counter() >= deadline:
                 break
-            if all(_cooldown_active(lbl, mdl) for _, lbl, mdl, _, _ in ordered_buckets):
-                break  # every quota bucket is exhausted - fail fast
+            if tried_any:
+                continue                  # a bucket answered badly - one retry pass below
+            # Every quota bucket is on cooldown. Waiting out the nearest one is
+            # still far better than dropping to the canned engine: a few quiet
+            # seconds is exactly what a human would do before answering anyway.
+            budget_left = deadline - time.perf_counter()
+            if soonest_free_in is None or soonest_free_in > GEMINI_WAIT_S \
+                    or soonest_free_in + 6.0 > budget_left:
+                break
+            print(f"AI waiting {soonest_free_in:.0f}s for a rate-limited provider bucket...")
+            log_thought("AI_WAIT",
+                        f"Every model bucket is rate-limited - holding {soonest_free_in:.0f}s for the "
+                        "nearest one instead of sending a scripted line.")
+            time.sleep(soonest_free_in + 0.25)
 
         raise last_err or RuntimeError("All model quota buckets are cooling down - tactical fallback")
 
-    try:
+    def _fallback(reason: str) -> tuple[str, str, Optional[str], Optional[str]]:
+        """The model could not be trusted for this turn. The deterministic
+        engine answers, but the reason is always logged - a canned reply must
+        never be able to hide behind silence in the thought ticker."""
+        print(f"AI BRAIN FALLBACK: {reason}")
+        thought, reply, fake_img, canary = get_deterministic_tactical_reply(scammer_msg, clean_base, amount_str)
+        log_thought("AI_FALLBACK", f"{reason}. Tactical engine answered: {thought}")
+        return thought, reply, fake_img, canary
+
+    def _attempt(correction: str, previous: str = ""):
         # NOTE: no `with ThreadPoolExecutor(...)` here - its __exit__ calls
         # shutdown(wait=True) and would block until the model answered,
         # making the timeout below meaningless.
-        future = GEMINI_EXECUTOR.submit(_call_gemini)
+        future = GEMINI_EXECUTOR.submit(_call_gemini, correction, previous)
         try:
-            raw_text, canary_url, fake_img_url = future.result(timeout=GEMINI_TIMEOUT_S)
+            raw_text, canary_url, fake_img_url = future.result(timeout=GEMINI_BUDGET_S)
         except FutureTimeoutError:
             future.cancel()
             raise
+        except Exception as ex:
+            raise _ModelTransportError(f"{type(ex).__name__}: {ex}") from ex
+        try:
+            decision = AgentDecision(**_parse_agent_json(raw_text))
+        except Exception as ex:
+            raise _ModelOutputError(f"{type(ex).__name__}: {ex}") from ex
+        return decision, canary_url, fake_img_url
 
-        decision_data = _parse_agent_json(raw_text)
-        decision = AgentDecision(**decision_data)
+    rejection = ""
+    rejected_reply = ""
+    last_transport = None
+    try:
+        # Two passes: the second one carries the exact reason the first reply
+        # was rejected, so the model fixes itself instead of the turn silently
+        # collapsing onto a scripted pool line.
+        for _ in range(2):
+            try:
+                decision, canary_url, fake_img_url = _attempt(rejection, rejected_reply)
+            except FutureTimeoutError:
+                raise
+            except _ModelTransportError as ex:
+                last_transport = ex
+                if rejection:
+                    raise               # a rewrite already failed on the wire
+                continue                # provider problem - one clean retry
+            except _ModelOutputError:
+                rejection = ("your answer was not the required JSON object. Reply with only "
+                             '{"reply_text": "...", "selected_tool": "...", "internal_thought": "..."}')
+                rejected_reply = ""
+                log_thought("AI_RETRY", "Model returned an unusable response - asking it to rewrite.")
+                continue
+            last_transport = None
 
-        reply = _sanitize_model_reply(decision.reply_text)
-        tool = (decision.selected_tool or "NONE").strip().upper()
-        if tool not in ("NONE", "SEND_FAKE_UPI_GLITCH", "SEND_CANARY_LINK"):
-            tool = "NONE"
+            outcome = _apply_model_decision(decision, intent, scammer_msg, canary_url, fake_img_url)
+            if not outcome["problem"]:
+                log_thought(f"AI ({outcome['tool']} -> {outcome['payload']})", outcome["thought"])
+                return outcome["thought"], outcome["reply"], outcome["media"], outcome["trap"]
+            rejection = outcome["problem"]
+            rejected_reply = str(outcome.get("attempt") or "")[:400]
+            log_thought("AI_RETRY",
+                        f"Rejected a reply and asked for a rewrite: {rejection}"
+                        + (f" | it said: {rejected_reply}" if rejected_reply else ""))
 
-        # Language mirror: an English scam script must never get a Hinglish reply.
-        if reply is not None and _wants_english(scammer_msg or "") and _HINGLISH_MARKER_RE.search(reply):
-            reply = None
-
-        # Never let the model paste a link of its own invention into the chat.
-        if reply is not None and _URL_RE.search(reply) and canary_url not in reply:
-            reply = _URL_RE.sub("", reply).strip()
-            reply = re.sub(r"\s{2,}", " ", reply) or None
-
-        media_url = None
-        trap_url = None
-        payload = "none"
-
-        if reply is not None:
-            with STATE_LOCK:
-                payload = _payload_decision_locked(intent, scammer_msg)
-            # The conversation decides the payload - UPI shared -> failure
-            # screenshot, "payment nahi aayi" push / bank details -> tracking
-            # link, nothing shared yet -> just talk. The model only writes text.
-            if payload == "screenshot":
-                media_url = fake_img_url
-                if not re.search(r"screenshot|fail|error|limit|hold|u16", reply, re.IGNORECASE):
-                    reply = (
-                        "Payment failed ho gaya, daily limit dikha raha hai. Ye dekh screenshot, "
-                        "dusra account de do IMPS se kar deta hu."
-                        if not _wants_english(scammer_msg or "") else
-                        "The payment failed with a daily limit error. See the screenshot - "
-                        "send another account and I'll do IMPS from there."
-                    )
-            elif payload == "link":
-                trap_url = canary_url
-                if canary_url not in reply:
-                    reply = f"{reply}\n{_tracking_link_line(scammer_msg or '', canary_url)}"
-
-        if reply is None:
-            fb_thought, fb_reply, fb_media, fb_canary = get_deterministic_tactical_reply(scammer_msg, clean_base, amount_str)
-            return fb_thought, fb_reply, fb_media, fb_canary
-
-        log_thought(f"AI ({tool} -> {payload})", decision.internal_thought)
-        return decision.internal_thought, reply, media_url, trap_url
+        if last_transport:
+            raise last_transport
+        return _fallback(f"model reply rejected twice: {rejection}")
 
     except FutureTimeoutError:
-        print(f"GEMINI TIMEOUT after {GEMINI_TIMEOUT_S}s - using tactical fallback.")
-        thought, reply, fake_img, canary = get_deterministic_tactical_reply(scammer_msg, clean_base, amount_str)
-        log_thought("TACTICAL_FALLBACK", f"Fallback (Timeout): {thought}")
-        return thought, reply, fake_img, canary
+        print(f"GEMINI TIMEOUT after {GEMINI_BUDGET_S}s - using tactical fallback.")
+        return _fallback(f"model timed out after {GEMINI_BUDGET_S}s")
 
     except Exception as e:
-        if "cooling down" in str(e):
+        detail = str(e)[:300]
+        if "cooling down" in detail:
             print("GEMINI: all quota buckets cooling down - tactical engine answers (human pacing unchanged).")
-        else:
-            print("GEMINI AGENT EXCEPTION:", repr(e))
-        thought, reply, fake_img, canary = get_deterministic_tactical_reply(scammer_msg, clean_base, amount_str)
-        log_thought("TACTICAL_FALLBACK", f"Fallback ({type(e).__name__}): {thought}")
-        return thought, reply, fake_img, canary
+            return _fallback("every model quota bucket is cooling down")
+        print("GEMINI AGENT EXCEPTION:", repr(e))
+        return _fallback(f"model error ({type(e).__name__}: {detail})")
 
 
 # =====================================================================
@@ -2683,7 +3019,7 @@ def handle_wa_incoming(request: Request, payload: Dict[str, Any] = Body(...)):
     base_url = ctx["base_url"]
 
     extracted_amt = extract_amount_demanded(text)
-    _set_ai_activity("thinking", time.time() * 1000 + (GEMINI_TIMEOUT_S + 5) * 1000)
+    _set_ai_activity("thinking", time.time() * 1000 + (GEMINI_BUDGET_S + 5) * 1000)
     t_agent = time.perf_counter()
     thought, reply_text, media_url, trap_url = run_hijack_agent(text, base_url)
     model_ms = int((time.perf_counter() - t_agent) * 1000)
