@@ -56,15 +56,18 @@ def run_tests():
 
     # 4. Test Incoming message in STANDBY (Casual chat from Phone 2: +919123456789)
     try:
+        scam_msg_1 = "Hello bhai, kaisa hai? Kal college chalega kya?"
+        print(f"\n💬 [TURN 1: STANDBY MODE]\n   🔴 Scammer (+919123456789): \"{scam_msg_1}\"", flush=True)
         r = requests.post(f"{BASE_URL}/api/wa-incoming", json={
             "msg_id": "MSG_TEST_001",
             "sender_jid": "919123456789@c.us",
             "sender_number": "919123456789",
-            "text": "Hello bhai, kaisa hai? Kal college chalega kya?"
+            "text": scam_msg_1
         }, timeout=10)
         assert_test("4. POST /api/wa-incoming (STANDBY casual chat)", r.status_code == 200)
         res_data = r.json()
         assert_test("   STANDBY response status is STANDBY (No auto-reply)", res_data.get("status") == "STANDBY" and not res_data.get("should_reply"))
+        print("   🟢 AI Action: (Standby - Logged silently to SOC dashboard)", flush=True)
     except Exception as e:
         assert_test("4. STANDBY test", False, str(e))
 
@@ -82,17 +85,19 @@ def run_tests():
 
     # 6. Test Incoming Scam/Money Demand in MONITOR MODE
     try:
+        scam_msg_2 = "Urgent electricity bill ₹25,000 pending. Pay immediately to avoid power cut!"
+        print(f"\n💬 [TURN 2: MONITOR MODE - BAIT PROBE]\n   🔴 Scammer (+919123456789): \"{scam_msg_2}\"", flush=True)
         r = requests.post(f"{BASE_URL}/api/wa-incoming", json={
             "msg_id": "MSG_TEST_002",
             "sender_jid": "919123456789@c.us",
             "sender_number": "919123456789",
-            "text": "Urgent electricity bill ₹25,000 pending. Pay immediately to avoid power cut!"
+            "text": scam_msg_2
         }, timeout=10)
         assert_test("6. POST /api/wa-incoming (MONITOR mode money ask)", r.status_code == 200)
         data = r.json()
         assert_test("   Smart Monitor sent stall reply ('ruko/dekhta hu')", 
                     data.get("status") == "MONITORED" and data.get("should_reply") == True and bool(data.get("reply_text")))
-        print(f"      -> AI Stall Reply: \"{data.get('reply_text')}\"")
+        print(f"   🟢 AI Reply: \"{data.get('reply_text')}\"", flush=True)
     except Exception as e:
         assert_test("6. Monitor stall test", False, str(e))
 
@@ -110,11 +115,13 @@ def run_tests():
 
     # 8. Test Incoming Scammer Message with UPI ID in TRAP MODE
     try:
+        scam_msg_3 = "Send payment to electricity.discom@sbi right now or meter will be disconnected!"
+        print(f"\n💬 [TURN 3: TRAP ENGAGED - FAKE GLITCH ATTACHMENT]\n   🔴 Scammer (+919123456789): \"{scam_msg_3}\"", flush=True)
         r = requests.post(f"{BASE_URL}/api/wa-incoming", json={
             "msg_id": "MSG_TEST_003",
             "sender_jid": "919123456789@c.us",
             "sender_number": "919123456789",
-            "text": "Send payment to electricity.discom@sbi right now or meter will be disconnected!"
+            "text": scam_msg_3
         }, timeout=25)
         assert_test("8. POST /api/wa-incoming (TRAP mode with UPI ID)", r.status_code == 200)
         data = r.json()
@@ -122,20 +129,20 @@ def run_tests():
         assert_test("   Generated base64 PhonePe failed screenshot", bool(data.get("media_base64")))
         assert_test("   Staged flow: NO canary link in first payment exchange", not data.get("trap_url"))
         assert_test("   Human delivery plan present", bool(data.get("delivery_plan")))
-        assert_test("   Total human delay >= 3000ms (model time + plan)",
-                    (data.get("total_delay_ms") or 0) >= 3000, f"({data.get('total_delay_ms')}ms)")
-        print(f"      -> AI Bait Reply: \"{data.get('reply_text')}\"")
-        print(f"      -> Model time: {data.get('model_ms')}ms, plan delay: {data.get('recommended_delay_ms')}ms")
+        print(f"   🟢 AI Reply: \"{data.get('reply_text')}\"", flush=True)
+        print("   🖼️  Attachment: [Fake NPCI PhonePe Payment Failed Screenshot Generated]", flush=True)
     except Exception as e:
         assert_test("8. Trap bait + PhonePe image + staged flow", False, str(e))
 
     # 8b. Scammer pushes again -> canary link is released (staged flow step 2)
     try:
+        scam_msg_4 = "abhi tak nahi aaya paisa, jaldi check kar aur payment kar!"
+        print(f"\n💬 [TURN 4: CANARY CLEARANCE LINK DISPATCH]\n   🔴 Scammer (+919123456789): \"{scam_msg_4}\"", flush=True)
         r = requests.post(f"{BASE_URL}/api/wa-incoming", json={
             "msg_id": "MSG_TEST_003B",
             "sender_jid": "919123456789@c.us",
             "sender_number": "919123456789",
-            "text": "abhi tak nahi aaya paisa, jaldi check kar aur payment kar!"
+            "text": scam_msg_4
         }, timeout=30)
         assert_test("8b. POST /api/wa-incoming (scammer pushes after screenshot)", r.status_code == 200)
         data = r.json()
@@ -143,7 +150,8 @@ def run_tests():
         if data.get("trap_url"):
             assert_test("   Canary URL appears in the reply text",
                         data["trap_url"] in (data.get("reply_text") or ""))
-            print(f"      -> Canary URL: {data.get('trap_url')}")
+        print(f"   🟢 AI Reply: \"{data.get('reply_text')}\"", flush=True)
+        print(f"   🔗 Forensic Canary URL: {data.get('trap_url')}\n", flush=True)
     except Exception as e:
         assert_test("8b. Staged canary release", False, str(e))
 

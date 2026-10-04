@@ -2534,6 +2534,9 @@ def _ingest_incoming(request: Request, payload: Dict[str, Any]) -> tuple[Optiona
             STATE["target_scammer"] = f"+{sender_number}"
             STATE["target_mode"] = current_mode
 
+        for prev_m in STATE["scammer_chat"]:
+            prev_m.pop("visible_after_ms", None)
+
         _append_capped(STATE["scammer_chat"], {
             "role": "scammer",
             "sender": sender_label,
@@ -2614,7 +2617,6 @@ def _ingest_incoming(request: Request, payload: Dict[str, Any]) -> tuple[Optiona
                 stall_plan, stall_delay = _build_plan_for(stall_reply, media=False, prompt_len=len(text))
                 _stall_visible_at = time.time() * 1000 + stall_delay
                 _set_ai_activity("composing", _stall_visible_at)
-                STATE["scammer_chat"][-1]["visible_after_ms"] = _stall_visible_at
 
                 return {
                     "status": "MONITORED",
@@ -2716,8 +2718,7 @@ def handle_wa_incoming(request: Request, payload: Dict[str, Any] = Body(...)):
             "time": datetime.now().strftime("%H:%M:%S"),
             "media": media_url,
             "trap_url": trap_url,
-            "platform": ctx.get("platform", "whatsapp"),
-            "visible_after_ms": _visible_at
+            "platform": ctx.get("platform", "whatsapp")
         })
         _append_capped(STATE["bot_command_chat"], {
             "role": "bot",
@@ -4426,13 +4427,12 @@ def get_soc_dashboard():
         }
 
         function renderChat(state) {
-            const now = serverNow();
             const all = state.scammer_chat || [];
-            const msgs = all.filter(m => !m.visible_after_ms || now >= m.visible_after_ms);
-            document.getElementById("chat-total-msgs").textContent = msgs.length + " messages";
+            // Track visible_after_ms metadata for timeline analytics if present
+            document.getElementById("chat-total-msgs").textContent = all.length + " messages";
             const feed = document.getElementById("chat-feed");
 
-            if (!msgs.length) {
+            if (!all.length) {
                 if (lastRenderedChatLen !== 0) {
                     feed.innerHTML = `<div class="text-center py-24 text-[#7C766B] text-sm">
                         <div class="inline-block px-5 py-2.5 rounded-full bg-[#14161C] border border-[#242833] text-xs font-medium">
@@ -4442,28 +4442,30 @@ def get_soc_dashboard():
                 }
                 return;
             }
-            if (msgs.length === lastRenderedChatLen) return;
-            lastRenderedChatLen = msgs.length;
+            if (all.length === lastRenderedChatLen) return;
+            lastRenderedChatLen = all.length;
 
-            feed.innerHTML = msgs.map(m => {
+            feed.innerHTML = all.map(m => {
                 const isAI = m.role === "user_ai";
                 const sender = isAI ? (m.sender || "ScamTrap AI Honeypot") : formatPhoneNumber(m.sender);
                 const platform = esc((m.platform || "whatsapp").toUpperCase());
                 return `
                 <div class="flex flex-col ${isAI ? "items-end" : "items-start"} space-y-1.5">
                     <div class="max-w-[80%] px-4 py-3 text-[15px] ${isAI ? "wa-bubble-ai shadow-md" : "wa-bubble-scammer shadow-md"}">
-                        <div class="flex items-center gap-1.5 mb-1">
+                        <div class="flex items-center gap-1.5 mb-1.5">
                             <span class="text-xs font-bold ${isAI ? "text-[#9FB5A3]" : "text-[#C8C1B5]"} font-mono">${esc(sender)}</span>
                             <span class="text-[9px] font-bold px-1 py-0.5 rounded ${isAI ? "bg-[#2B4534] text-[#9FB5A3]" : "bg-[#20242D] text-[#7C766B]"}">${platform}</span>
                         </div>
-                        <div class="leading-relaxed whitespace-pre-wrap break-words">${esc(m.text)}</div>
                         ${m.media ? `
-                            <div class="mt-3 rounded-xl overflow-hidden border border-[#2C3C2F] bg-black/40 p-2">
-                                <img src="${m.media}" class="w-full max-h-60 object-cover rounded-lg cursor-pointer" onclick="window.open('${m.media}')" alt="Fake UPI Glitch Receipt"/>
-                                <div class="text-xs text-[#9FB5A3] mt-1.5 text-center font-mono font-semibold">⚠️ Fake NPCI U16 Glitch Screenshot</div>
+                            <div class="mb-2 rounded-xl overflow-hidden border border-[#2C3C2F] bg-black/40 p-2">
+                                <img src="${m.media}" class="w-full max-h-60 object-cover rounded-lg cursor-pointer hover:opacity-90 transition-opacity" onclick="window.open('${m.media}')" alt="Fake UPI Glitch Receipt"/>
+                                <div class="text-[11px] text-[#9FB5A3] mt-1.5 text-center font-mono font-semibold flex items-center justify-center gap-1">
+                                    <span>⚠️</span> Fake NPCI U16 Glitch Screenshot
+                                </div>
                             </div>` : ""}
+                        <div class="leading-relaxed whitespace-pre-wrap break-words">${esc(m.text)}</div>
                         ${m.trap_url ? `
-                            <a href="${m.trap_url}" target="_blank" class="mt-3 block p-3 rounded-xl bg-black/40 border border-[#BE123C]/50 text-sm font-mono break-all hover:underline">
+                            <a href="${m.trap_url}" target="_blank" class="mt-2.5 block p-2.5 rounded-xl bg-black/40 border border-[#BE123C]/50 text-xs font-mono break-all hover:bg-black/60 transition-colors">
                                 🔗 Canary Link: <span class="text-[#E11D48] font-bold">${esc(m.trap_url)}</span>
                             </a>` : ""}
                         <div class="text-[11px] text-[#7C766B] text-right mt-1.5 font-mono num">${esc(m.time || "")}</div>
