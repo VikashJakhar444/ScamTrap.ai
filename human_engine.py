@@ -33,7 +33,7 @@ READ_DELAY_RANGE = (1600, 3600)       # pickup + read + think, before typing
 READ_FLOOR_MS = 1500                  # a real human never answers instantly
 READ_PER_CHAR_MS = 6                  # longer message -> longer read
 READ_MAX_MS = 9000
-RESIDUAL_WAIT_MS = 350                # wait left after "thinking time" is absorbed
+RESIDUAL_WAIT_MS = 650                # wait left after "thinking time" is absorbed
 
 TYPING_BASE_MS = (400, 900)           # unlock, open chat, focus field
 TYPING_PER_CHAR_MS = (0.045, 0.10)    # quick but still human thumb typing
@@ -103,9 +103,9 @@ def split_bubbles(
 
 def read_delay_ms(prompt_len: int = 0, pace: float = 1.0) -> int:
     """Delay between the scammer's message arriving and the typing indicator
-    starting (phone pickup, reading, thinking). Always >= ~3s: nobody
-    answers instantly, and the model's own thinking time lives inside this
-    window (see build_delivery_plan(elapsed_ms=...))."""
+    starting (phone pickup, reading, thinking). Never below READ_FLOOR_MS:
+    nobody answers instantly, and the model's own thinking time lives inside
+    this window (see build_delivery_plan(elapsed_ms=...))."""
     base = random.uniform(*READ_DELAY_RANGE) + min(int(prompt_len or 0), 400) * READ_PER_CHAR_MS
     # 10% of the time the victim is distracted (busy, away, reading something else)
     if random.random() < 0.10:
@@ -117,7 +117,7 @@ def absorb_elapsed(target_ms: float, elapsed_ms: int) -> int:
     """Subtract time already spent (Gemini generating the reply) from a planned
     wait. The scammer only sees wall-clock time: if the model took 4s of a 4.5s
     read delay, only the remaining ~0.5s has to be planned - but the typing
-    indicator must still never start before the human read floor."""
+    indicator must still never start before RESIDUAL_WAIT_MS."""
     return int(max(RESIDUAL_WAIT_MS, target_ms - max(0, int(elapsed_ms))))
 
 

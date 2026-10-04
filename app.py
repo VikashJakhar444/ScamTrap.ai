@@ -507,6 +507,7 @@ STATE: Dict[str, Any] = {
     "target_mode": "STANDBY",      # "STANDBY", "TRAP", "MONITOR"
     "incoming_threads": {},        # phone_number -> {jid, sender_number, last_msg, last_time, mode, is_trapped, is_monitored, msg_count}
     "scammer_chat": [],            # [{role, sender, text, time, media, trap_url}]
+    "conversation_key": None,      # sender number owning scammer_chat; new key = new conversation
     "bot_command_chat": [          # [{role, sender, text, time}]
         {
             "role": "bot",
@@ -663,12 +664,65 @@ def _ensure_persona_locked() -> Dict[str, Any]:
     return persona
 
 
+_PAYMENT_CONTEXT_INTENTS = {"payment_details", "money_demand", "scam_bill", "scam_job", "scam_threat"}
+
+
 def _link_allowed(glitch_sent: int, scam_links: int, links_sent: int, force: bool = False) -> bool:
     """Allows sending canary forensic tracking links to capture suspect IP and location.
-    Enables forensic trap links whenever payment or scam discussion is active."""
-    if links_sent >= 6:
+    Hard budget of 3 links per conversation - enough for the IP capture, low enough
+    that the link never becomes a spam pattern the scammer can pattern-match."""
+    if links_sent >= 3:
         return False
     return True
+
+
+def _known_payee_locked(text: str = "") -> Optional[str]:
+    """The UPI/payee id this conversation turn is dealing with - taken from the
+    message in front of us, else from what the chat already extracted."""
+    match = _UPi_ID_RE_FALLBACK.search(text or "")
+    payee = match.group(0) if match else None
+    if payee and payee.lower().endswith(_EMAIL_DOMAINS):
+        payee = None
+    if payee:
+        return payee
+    return next(iter(STATE["extracted_intel"]["upi_ids"]), None)
+
+
+def _payload_decision_locked(intent: str, text: str) -> str:
+    """Which payload (if any) this turn has earned, decided purely from the
+    conversation - never from a running counter:
+
+      "none"      - casual chat, or a payment demand before any payment details
+                    were shared: the victim just asks how to pay.
+      "screenshot"- their UPI id is known and the failed-transfer screenshot
+                    story has not been told yet in this conversation.
+      "link"      - they gave bank+IFSC details, or they are pushing for money
+                    AFTER the failure story: the natural moment the victim
+                    pastes "maine bhej di, espe dekh le" tracking link.
+
+    Caller must hold STATE_LOCK."""
+    if intent not in _PAYMENT_CONTEXT_INTENTS:
+        return "none"
+
+    glitch_sent, links_sent, scam_links = _payload_state_from_chat_locked()
+    intel = STATE["extracted_intel"]
+    has_bank = bool(intel["bank_accounts"] or intel["ifsc_codes"])
+    if not has_bank:
+        body = text or ""
+        has_bank = bool(
+            _IFSC_CODE_RE.search(body.upper())
+            or re.search(r"(a/?c|account|ac ?no|acct)\s*(no|number|#)?\s*[:\-]?\s*\d{9,}", body, re.IGNORECASE)
+        )
+
+    budget_ok = _link_allowed(glitch_sent, scam_links, links_sent)
+
+    if has_bank:
+        return "link" if budget_ok else "none"
+    if not _known_payee_locked(text):
+        return "none"                       # payment details not shared yet -> ask
+    if glitch_sent == 0:
+        return "screenshot"                 # first time their UPI shows up
+    return "link" if budget_ok else "none"  # "payment nahi aayi" push -> tracking link
 
 
 def classify_intent(text: str) -> str:
@@ -814,6 +868,39 @@ def _payload_state_from_chat_locked() -> tuple[int, int, int]:
             if m.get("trap_url"):
                 links_sent += 1
     return glitch_sent, links_sent, scam_links
+
+
+def _start_new_conversation_locked(prev_key: str, new_key: str) -> None:
+    """Switch the active conversation to a new scammer: restart the kill chain
+    from stage 0 instead of carrying the previous chat's funnel, session, IOC
+    and message history into this one.
+
+    Phone-level state survives (persona, canary hits, thought logs, thread
+    telemetry, processed msg ids) - only conversation-level state is dropped.
+    Must be called with STATE_LOCK held."""
+    prev_key_label = prev_key if prev_key.startswith("LID:") else f"+{prev_key}"
+    new_key_label = new_key if new_key.startswith("LID:") else f"+{new_key}"
+    STATE["conversation_key"] = new_key
+    STATE["scammer_chat"].clear()
+    STATE["funnel"] = {"stage": 0, "payment_asks": 0, "blocked": 0, "stalled_amounts": []}
+    STATE["scam_type_counts"] = {}
+    STATE["aggression"] = {"current": 0, "average": 0, "peak": 0, "history": []}
+    STATE["extracted_intel"] = {
+        "upi_ids": set(),
+        "phone_numbers": set(),
+        "ifsc_codes": set(),
+        "bank_accounts": set(),
+    }
+    STATE["session"] = _fresh_session()
+    STATE["ai_activity"] = {"active": False, "phase": "", "until_ms": 0.0}
+    # Let the incoming handler re-point the dashboard at the new suspect.
+    STATE["target_scammer"] = None
+    STATE["target_mode"] = "STANDBY"
+    log_thought(
+        "CONVERSATION",
+        f"New conversation from {new_key_label} - closing {prev_key_label}. "
+        "Kill chain restarted (funnel back to APPROACH, session/IOCs/chat cleared).",
+    )
 
 
 def _build_plan_for(reply_text: str, media: bool, prompt_len: int, elapsed_ms: int = 0) -> tuple[List[Dict[str, Any]], int]:
@@ -1097,7 +1184,7 @@ def get_deterministic_tactical_reply(scammer_msg: str, base_url: str, amount_str
         amount_str = extract_amount_demanded(scammer_msg)
 
     canary_id = f"TXN-{uuid.uuid4().hex[:6].upper()}"
-    canary_url = f"{clean_base}/receipt/{canary_id}"
+    canary_url = f"{clean_base}/pay/status/{canary_id}"
 
     with STATE_LOCK:
         persona = _ensure_persona_locked()
@@ -1145,45 +1232,36 @@ def get_deterministic_tactical_reply(scammer_msg: str, base_url: str, amount_str
         "last": last_scammer_msg[:80],
     }
     link_ok = _link_allowed(glitch_sent, scam_links, links_sent)
-    link_ok_force = _link_allowed(glitch_sent, scam_links, links_sent, force=True)
+    link_ok_force = link_ok
 
-    if intent == "payment_details":
-        # Staged flow: bank-only details -> IMPS hold link; first UPI artefact
-        # -> failure screenshot (NO link yet); later pushes -> canary link.
-        if glitch_sent == 0 and not pay_upi and has_bank and link_ok_force:
+    if intent in ("payment_details", "scam_bill", "scam_job", "scam_threat", "money_demand"):
+        # One staged flow decides every payment-shaped turn (same rule the AI
+        # brain uses): no payment details shared yet -> just ask how to pay,
+        # their UPI known -> failure screenshot, bank+IFSC given or "money never
+        # arrived" push after the screenshot -> tracking link.
+        payload = _payload_decision_locked(intent, text)
+        if payload == "link" and link_ok:
             trap_url = canary_url
-            options = _fill(POOL_IMPS_EN if english else POOL_IMPS_HI, ctx)
-        elif glitch_sent == 0 and fake_receipt_url:
+            if intent == "payment_details" and glitch_sent == 0 and not pay_upi and has_bank:
+                options = _fill(POOL_IMPS_EN if english else POOL_IMPS_HI, ctx)
+            else:
+                options = _fill(POOL_CANARY_EN if english else POOL_CANARY_HI, ctx)
+        elif payload == "screenshot" and fake_receipt_url:
             media_url = fake_receipt_url
             options = _fill(POOL_GLITCH_EN if english else POOL_GLITCH_HI, ctx)
-        elif link_ok:
-            trap_url = canary_url
-            options = _fill(POOL_CANARY_EN if english else POOL_CANARY_HI, ctx)
-        else:
+        elif pay_upi or has_bank:
+            # Payment details are already in the conversation but this turn has
+            # earned no payload (link budget spent) - stall on the bank hold.
             options = _fill(POOL_NOLINK_EN if english else POOL_NOLINK_HI, ctx)
-
-    elif intent in ("scam_bill", "scam_job", "scam_threat", "money_demand"):
-        if glitch_sent >= 1:
-            # They already saw the failure screenshot and are pushing again -
-            # this is the natural moment a victim pastes the "bank verification" link.
-            if link_ok:
-                trap_url = canary_url
-                options = _fill(POOL_CANARY_EN if english else POOL_CANARY_HI, ctx)
-            else:
-                options = _fill(POOL_NOLINK_EN if english else POOL_NOLINK_HI, ctx)
+        elif intent == "payment_details":
+            options = _fill(POOL_NOLINK_EN if english else POOL_NOLINK_HI, ctx)
         else:
-            if pay_upi and glitch_sent == 0 and fake_receipt_url:
-                # Their UPI is already known -> pretend the transfer was made
-                # and show the failure screenshot (the bait progression).
-                media_url = fake_receipt_url
-                options = _fill(POOL_GLITCH_EN if english else POOL_GLITCH_HI, ctx)
-            else:
-                bait_pool = {
-                    "scam_bill": POOL_BAIT_BILL_EN if english else POOL_BAIT_BILL_HI,
-                    "scam_job": POOL_BAIT_JOB_EN if english else POOL_BAIT_JOB_HI,
-                    "scam_threat": POOL_BAIT_THREAT_EN if english else POOL_BAIT_THREAT_HI,
-                }.get(intent, POOL_BAIT_MONEY_EN if english else POOL_BAIT_MONEY_HI)
-                options = _fill(bait_pool, ctx)
+            bait_pool = {
+                "scam_bill": POOL_BAIT_BILL_EN if english else POOL_BAIT_BILL_HI,
+                "scam_job": POOL_BAIT_JOB_EN if english else POOL_BAIT_JOB_HI,
+                "scam_threat": POOL_BAIT_THREAT_EN if english else POOL_BAIT_THREAT_HI,
+            }.get(intent, POOL_BAIT_MONEY_EN if english else POOL_BAIT_MONEY_HI)
+            options = _fill(bait_pool, ctx)
 
     elif intent == "refusal":
         # "I don't want money to check" -> drop the payment act, chat normally
@@ -1266,7 +1344,6 @@ def get_deterministic_tactical_reply(scammer_msg: str, base_url: str, amount_str
     return thought, reply, media_url, trap_url
 
 
-_PAYMENT_CONTEXT_INTENTS = {"payment_details", "money_demand", "scam_bill", "scam_job", "scam_threat"}
 _SELF_REVEAL_RE = re.compile(
     r"(\b(i am|i'?m|im|this is|being)\s+(an?\s+)?(ai|bot|robot|machine|assistant|chatbot|llm)\b"
     r"|honeypot|scamtrap|language model|i was (programmed|trained|built|deployed)|as an ai)",
@@ -1291,6 +1368,18 @@ def _sanitize_model_reply(reply: str) -> Optional[str]:
     return reply
 
 
+_HINGLISH_MARKER_RE = re.compile(r"\b(bhai|yaar|arre|chalo|theek)\b", re.IGNORECASE)
+
+
+def _tracking_link_line(scammer_text: str, url: str) -> str:
+    """How a real victim pastes a payment-status link into the chat: plain,
+    in the scammer's own language, no 'canary/verification/bank link' label
+    that would make them hesitate before opening it."""
+    if _wants_english(scammer_text):
+        return f"sent it from my side just now, track it here once: {url}"
+    return f"maine abhi bhej diya hai, idhar se dekh le status: {url}"
+
+
 def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optional[str], Optional[str]]:
     """Executes Gemini 2.5 Flash honeypot agent with full chat context, falling
     back to the deterministic tactical engine if the model times out or errors."""
@@ -1311,6 +1400,7 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             target_scam = STATE.get("target_scammer", "")
             latest_upi = get_contextual_payee(target_scam)
             persona = _ensure_persona_locked()
+            payload_step = _payload_decision_locked(intent, scammer_msg)
             # Full conversation, oldest -> newest, with payload markers so the
             # model can SEE what was already sent instead of being told counts.
             chat_lines = []
@@ -1320,12 +1410,12 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
                 if m.get("media"):
                     line += "  [you sent a payment-failed screenshot]"
                 if m.get("trap_url"):
-                    line += "  [you sent this bank-verification link]"
+                    line += "  [you sent a payment status link]"
                 chat_lines.append(line)
             intel_snapshot = {k: sorted(v) for k, v in STATE["extracted_intel"].items()}
 
         canary_id = f"TXN-{uuid.uuid4().hex[:6].upper()}"
-        canary_url = f"{clean_base}/receipt/{canary_id}"
+        canary_url = f"{clean_base}/pay/status/{canary_id}"
         encoded_upi = urllib.parse.quote(latest_upi)
         effective_amt = amount_str if amount_str else "500"
         encoded_amt = urllib.parse.quote(effective_amt)
@@ -1346,20 +1436,24 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             "In those replies NEVER mention money, payment, UPI, bank, transfers or scams.\n"
             "3. If they say they don't want money / no payment needed / 'leave it', drop the payment topic immediately and continue normally.\n"
             "4. ONLY when they are running a scam or demanding money (electricity bill disconnection, job/task fees, police/customs/CBI threats, "
-            "lottery, KYC block, direct payment demands) play along as a slightly naive, cooperative victim:\n"
-            "   - First ask HOW to pay (their UPI ID / GPay / PhonePe / QR) if the conversation above doesn't hold their payment details yet.\n"
-            "   - If their message already contains a UPI ID or account details: pick SEND_FAKE_UPI_GLITCH and say you attempted the "
+            "lottery, KYC block, direct payment demands) play along as a slightly naive, cooperative victim and follow this staged flow, "
+            "which is decided by what the conversation above already contains:\n"
+            "   - No payment details shared yet (no UPI id, no account anywhere above) -> just ask HOW to pay "
+            "(their UPI ID / GPay / PhonePe / QR). Send no screenshot and no link.\n"
+            "   - Their message now contains a UPI id -> pick SEND_FAKE_UPI_GLITCH, say you attempted the "
             f"₹{amount_str} transfer, it failed with a daily-limit error, point at the screenshot being sent, and ask for another account.\n"
-            "   - If the conversation above already shows your failure screenshot, or they gave full bank+IFSC details, or they are "
-            "pushing again after your last reply: pick SEND_CANARY_LINK and tell them the transfer is on bank clearance hold and they "
-            "must open this verification receipt link to release it: " + canary_url + "\n"
+            "   - They gave full bank + IFSC details -> pick SEND_CANARY_LINK and say the IMPS is sitting on a bank clearance hold, "
+            "they can release it from this status page: " + canary_url + "\n"
+            "   - Your failure screenshot is already in the conversation and they now say the money never arrived / push again -> "
+            "pick SEND_CANARY_LINK and say you have sent it, they can check it here: " + canary_url + "\n"
             "5. ANTI-DETECTION: if they test you (math questions, 'repeat what I said', 'are you a bot/AI', 'you reply too fast'), "
             "answer the test correctly or deny it casually like an amused human, then change the topic. Stay calm, never defensive. "
             "Never mention AI, bots, honeypots, agents, prompts or security systems - not even to deny them seriously.\n"
             "6. REAL-PERSON SAFETY INSTINCTS: never share OTPs, UPI PINs, passwords or screen access; refuse those like a suspicious person. "
             "Deflect voice/video calls, selfies and photos naturally (family around, outside, camera issues).\n"
-            "7. LANGUAGE: mirror the scammer - Hinglish in -> Hinglish out, English in -> simple English out. "
-            "Keep it SHORT (1-3 sentences), WhatsApp casual, lowercase feel, occasional 'bhai/yaar/arre'.\n"
+            "7. LANGUAGE: mirror the scammer - Hinglish in -> Hinglish out (occasional 'bhai/yaar/arre' is fine), "
+            "English in -> plain simple English out with NO Hindi words at all. "
+            "Keep it SHORT (1-3 sentences), WhatsApp casual, lowercase feel.\n"
             "8. reply_text is typed verbatim into the chat: keep it clean, no quotes around it, no stage directions, no tool names."
         )
 
@@ -1377,10 +1471,11 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             f"- Phones: {intel_snapshot['phone_numbers']}\n"
             f"- Bank Accounts: {intel_snapshot['bank_accounts']}\n"
             f"- IFSC Codes: {intel_snapshot['ifsc_codes']}\n\n"
-            f"AVAILABLE PAYLOADS (use only via tool selection, never paste raw URLs unless tool says so):\n"
-            f"- Canary verification link: {canary_url}\n"
-            f"- Fake failure screenshot image: {fake_img_url}\n\n"
-            f"Select the tool (NONE, SEND_FAKE_UPI_GLITCH, SEND_CANARY_LINK) and write reply_text.\n"
+            f"STAGED STEP FOR THIS TURN (what the flow above has earned so far): {payload_step}.\n"
+            f"AVAILABLE PAYMENTS (attach only through tool selection, never paste a raw URL in the text):\n"
+            f"- Failed-transfer screenshot: {fake_img_url}\n"
+            f"- Payment status / tracking link: {canary_url}\n\n"
+            f"Select the tool that matches that staged step (NONE, SEND_FAKE_UPI_GLITCH, SEND_CANARY_LINK) and write reply_text.\n"
             f"RESPOND WITH ONLY THIS JSON OBJECT (no markdown, no extra text):\n"
             f'{{"reply_text": "...", "selected_tool": "NONE", "internal_thought": "..."}}'
         )
@@ -1476,46 +1571,45 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
         if tool not in ("NONE", "SEND_FAKE_UPI_GLITCH", "SEND_CANARY_LINK"):
             tool = "NONE"
 
-        with STATE_LOCK:
-            # Screenshots/links already in this conversation - counted off the
-            # chat log, never off session bookkeeping.
-            glitch_sent, links_sent, scam_links = _payload_state_from_chat_locked()
-            has_bank = bool(STATE["extracted_intel"]["bank_accounts"] or STATE["extracted_intel"]["ifsc_codes"])
-            intel_upi = next(iter(STATE["extracted_intel"]["upi_ids"]), None)
+        # Language mirror: an English scam script must never get a Hinglish reply.
+        if reply is not None and _wants_english(scammer_msg or "") and _HINGLISH_MARKER_RE.search(reply):
+            reply = None
 
-        pay_m = _UPi_ID_RE_FALLBACK.search(scammer_msg or "")
-        pay_upi = pay_m.group(0) if pay_m else None
-        if pay_upi and pay_upi.lower().endswith(_EMAIL_DOMAINS):
-            pay_upi = None
-        pay_upi = pay_upi or intel_upi
+        # Never let the model paste a link of its own invention into the chat.
+        if reply is not None and _URL_RE.search(reply) and canary_url not in reply:
+            reply = _URL_RE.sub("", reply).strip()
+            reply = re.sub(r"\s{2,}", " ", reply) or None
 
         media_url = None
         trap_url = None
+        payload = "none"
 
-        # Payloads follow the conversation, not a counter:
-        #   - the model's own tool pick always wins (it read the whole chat)
-        #   - otherwise the chat decides the natural next step:
-        #       their UPI known, no failure screenshot yet -> screenshot
-        #       screenshot already in chat / bank+IFSC given / no UPI learned
-        #         -> canary verification link (the IP-capture payload)
-        #   - non-payment context -> never any payload
-        if tool == "SEND_FAKE_UPI_GLITCH":
-            media_url = fake_img_url
-        elif tool == "SEND_CANARY_LINK" or canary_url in (reply or "") or (
-                intent in _PAYMENT_CONTEXT_INTENTS
-                and (glitch_sent > 0 or has_bank or not pay_upi)
-                and _link_allowed(glitch_sent, scam_links, links_sent)):
-            trap_url = canary_url
-            if canary_url not in (reply or ""):
-                reply = f"{reply}\n\nBank receipt link: {canary_url}"
-        elif intent in _PAYMENT_CONTEXT_INTENTS and glitch_sent == 0 and pay_upi:
-            media_url = fake_img_url
+        if reply is not None:
+            with STATE_LOCK:
+                payload = _payload_decision_locked(intent, scammer_msg)
+            # The conversation decides the payload - UPI shared -> failure
+            # screenshot, "payment nahi aayi" push / bank details -> tracking
+            # link, nothing shared yet -> just talk. The model only writes text.
+            if payload == "screenshot":
+                media_url = fake_img_url
+                if not re.search(r"screenshot|fail|error|limit|hold|u16", reply, re.IGNORECASE):
+                    reply = (
+                        "Payment failed ho gaya, daily limit dikha raha hai. Ye dekh screenshot, "
+                        "dusra account de do IMPS se kar deta hu."
+                        if not _wants_english(scammer_msg or "") else
+                        "The payment failed with a daily limit error. See the screenshot - "
+                        "send another account and I'll do IMPS from there."
+                    )
+            elif payload == "link":
+                trap_url = canary_url
+                if canary_url not in reply:
+                    reply = f"{reply}\n{_tracking_link_line(scammer_msg or '', canary_url)}"
 
         if reply is None:
             fb_thought, fb_reply, fb_media, fb_canary = get_deterministic_tactical_reply(scammer_msg, clean_base, amount_str)
             return fb_thought, fb_reply, fb_media, fb_canary
 
-        log_thought(f"AI ({tool})", decision.internal_thought)
+        log_thought(f"AI ({tool} -> {payload})", decision.internal_thought)
         return decision.internal_thought, reply, media_url, trap_url
 
     except FutureTimeoutError:
@@ -2392,14 +2486,25 @@ def _ingest_incoming(request: Request, payload: Dict[str, Any]) -> tuple[Optiona
             if last_m.get("role") == "scammer" and last_m.get("text") == text and last_m.get("sender") == f"+{sender_number}":
                 return {"status": "DUPLICATE_IGNORED", "should_reply": False}, {}
 
+        is_trapped = sender_number in STATE["trapped_numbers"]
+        is_monitored = sender_number in STATE["monitored_numbers"]
+
+        # New conversation = new kill chain. When a different trapped/monitored
+        # number starts talking, the funnel, session, IOCs and chat log of the
+        # previous conversation are dropped so this chat begins at APPROACH
+        # instead of inheriting somebody else's BLOCKED stage.
+        if is_trapped or is_monitored:
+            prev_key = STATE.get("conversation_key")
+            if prev_key and prev_key != sender_number:
+                _start_new_conversation_locked(prev_key, sender_number)
+            elif not prev_key:
+                STATE["conversation_key"] = sender_number
+
         new_findings = extract_intelligence(text)
 
         # Scammer sending links themselves makes us sending one far less suspicious
         if _URL_RE.search(text):
             STATE["session"]["scammer_links_seen"] = int(STATE["session"].get("scammer_links_seen", 0)) + 1
-
-        is_trapped = sender_number in STATE["trapped_numbers"]
-        is_monitored = sender_number in STATE["monitored_numbers"]
 
         current_mode = "TRAP" if is_trapped else ("MONITOR" if is_monitored else "STANDBY")
 
@@ -2950,6 +3055,7 @@ def reset_session():
         STATE["target_mode"] = "STANDBY"
         STATE["incoming_threads"].clear()
         STATE["scammer_chat"].clear()
+        STATE["conversation_key"] = None
         STATE["outbox_queue"].clear()
         STATE["canary_hits"].clear()
         # A clean demo must also forget processed message IDs, otherwise every
@@ -3012,13 +3118,120 @@ def _valid_geo_coordinates(lat: Any, lon: Any) -> Optional[tuple[float, float]]:
     return latitude, longitude
 
 
+_GEO_PROVIDER_NAMES = ("ip-api.com", "ipapi.co", "ipwho.is")
+
+
+def _parse_geo_payload(provider: str, data: Any) -> Optional[Dict[str, Any]]:
+    """Normalise one provider's answer into the shared geo shape.
+
+    Every free provider speaks a slightly different dialect (ip-api:
+    regionName/lat, ipapi.co: country_name/latitude, ipwho.is:
+    connection.asn), so the parser accepts the union of those keys and only
+    refuses payloads that carry no place and no usable coordinate at all."""
+    if not isinstance(data, dict):
+        return None
+    if data.get("error") or (provider == "ip-api.com" and data.get("status") == "fail"):
+        return None
+    conn = data.get("connection") if isinstance(data.get("connection"), dict) else {}
+    asn = data.get("asn") or conn.get("asn") or ""
+    if isinstance(asn, int):
+        asn = f"AS{asn}"
+    elif asn and not str(asn).lower().startswith("as"):
+        asn = f"AS{asn}"
+    parsed = {
+        "country": data.get("country_name") or data.get("country") or "",
+        "region": data.get("region") or data.get("regionName") or "",
+        "city": data.get("city") or "",
+        "isp": data.get("isp") or conn.get("isp") or data.get("org") or conn.get("org") or "",
+        "org": data.get("org") or conn.get("org") or data.get("isp") or conn.get("isp") or "",
+        "as_num": str(asn or ""),
+        "lat": data.get("latitude", data.get("lat")),
+        "lon": data.get("longitude", data.get("lon")),
+        "geo_source": provider,
+    }
+    if _valid_geo_coordinates(parsed["lat"], parsed["lon"]):
+        parsed["lat"], parsed["lon"] = _valid_geo_coordinates(parsed["lat"], parsed["lon"])
+    elif any(parsed.get(key) for key in ("country", "region", "city")):
+        parsed["lat"] = None
+        parsed["lon"] = None
+    else:
+        return None
+    return parsed
+
+
+def _fetch_geo_provider(provider: str, ip: str) -> tuple[Optional[Dict[str, Any]], str]:
+    """One provider attempt: (parsed geo, "") on success, (None, reason) else."""
+    try:
+        if provider == "ip-api.com":
+            response = requests.get(
+                f"http://ip-api.com/json/{ip}",
+                params={"fields": "status,country,regionName,city,isp,org,as,lat,lon"},
+                timeout=4,
+            )
+        elif provider == "ipapi.co":
+            response = requests.get(
+                f"https://ipapi.co/{ip}/json/",
+                timeout=4,
+                headers={"User-Agent": "ScamTrapAI/1.0"},
+            )
+        else:
+            response = requests.get(f"https://ipwho.is/{ip}", timeout=4)
+        if response.status_code != 200:
+            return None, f"{provider} HTTP {response.status_code}"
+        parsed = _parse_geo_payload(provider, response.json())
+        if parsed is None:
+            return None, f"{provider} no location data"
+        return parsed, ""
+    except (requests.RequestException, ValueError) as error:
+        return None, f"{provider} {type(error).__name__}"
+
+
+def _merge_geo_results(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Consensus across every provider that answered: place/ISP fields by
+    majority vote, coordinates by averaging the agreeing providers (a single
+    provider still wins on its own - it is just a one-vote consensus)."""
+    merged: Dict[str, Any] = {}
+    for key in ("country", "region", "city", "isp", "org", "as_num"):
+        values = [str(r.get(key)) for r in results if r.get(key)]
+        if not values:
+            merged[key] = ""
+            continue
+        best, best_count = values[0], 0
+        for candidate in values:
+            count = values.count(candidate)
+            if count > best_count:
+                best, best_count = candidate, count
+        merged[key] = best
+    coords = [pair for pair in (_valid_geo_coordinates(r.get("lat"), r.get("lon")) for r in results) if pair]
+    if coords:
+        merged["lat"] = sum(pair[0] for pair in coords) / len(coords)
+        merged["lon"] = sum(pair[1] for pair in coords) / len(coords)
+        merged["geo_confidence"] = "multi_provider" if len(coords) > 1 else "single_provider"
+        if len(coords) > 1:
+            spread = max(
+                abs(coords[i][0] - coords[j][0]) + abs(coords[i][1] - coords[j][1])
+                for i in range(len(coords)) for j in range(i + 1, len(coords))
+            )
+            merged["provider_spread_deg"] = round(spread, 4)
+    else:
+        merged["lat"] = None
+        merged["lon"] = None
+    sources = list(dict.fromkeys(str(r.get("geo_source")) for r in results if r.get("geo_source")))
+    merged["geo_source"] = "+".join(sources)
+    return merged
+
+
 def _geolocate_ip(ip: str) -> Dict[str, Any]:
     """Best-effort city/region/country/ISP/ASN lookup for a captured IP.
 
     Cached per IP so repeat hits from the same scammer never re-query.
-    Uses keyless ip-api.com first and HTTPS ipapi.co as fallback. Private /
-    loopback addresses are skipped entirely. These results are approximate
-    network locations, not device GPS coordinates."""
+    Queries free providers in order (ip-api.com -> ipapi.co -> ipwho.is) and
+    stops as soon as one answer is confident (city + valid coordinates); a
+    partial answer keeps the next provider in the loop and the answers are
+    then merged by consensus, which is what makes the city-level estimate
+    reliable when one provider is rate-limited or wrong. Private / loopback
+    addresses are skipped entirely. These results are approximate network
+    locations, not device GPS coordinates."""
     with GEO_CACHE_LOCK:
         if ip in GEO_CACHE:
             return dict(GEO_CACHE[ip])
@@ -3026,69 +3239,30 @@ def _geolocate_ip(ip: str) -> Dict[str, Any]:
     if not _is_public_ip(ip):
         return {"geo_status": "not_public_ip"}
 
-    geo: Dict[str, Any] = {}
+    results: List[Dict[str, Any]] = []
     errors: List[str] = []
-    try:
-        response = requests.get(
-            "http://ip-api.com/json/" + ip,
-            params={"fields": "status,country,regionName,city,isp,org,as,lat,lon"},
-            timeout=4,
-        )
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, dict) and data.get("status") == "success":
-                geo = {
-                    "country": data.get("country", "") or "",
-                    "region": data.get("regionName", "") or "",
-                    "city": data.get("city", "") or "",
-                    "isp": data.get("isp", "") or "",
-                    "org": data.get("org", "") or "",
-                    "as_num": data.get("as", "") or "",
-                    "lat": data.get("lat"),
-                    "lon": data.get("lon"),
-                    "geo_source": "ip-api.com",
-                }
-            else:
-                errors.append(
-                    str(data.get("message") or data.get("status") or "lookup_failed")
-                    if isinstance(data, dict) else "ip-api.com invalid response"
-                )
-        else:
-            errors.append(f"ip-api.com HTTP {response.status_code}")
-    except (requests.RequestException, ValueError) as error:
-        errors.append(f"ip-api.com {type(error).__name__}")
+    geo: Dict[str, Any] = {}
+    for provider in _GEO_PROVIDER_NAMES:
+        parsed, error = _fetch_geo_provider(provider, ip)
+        if error:
+            errors.append(error)
+        if parsed:
+            results.append(parsed)
+        if not results:
+            continue
+        geo = _merge_geo_results(results)
+        if _valid_geo_coordinates(geo.get("lat"), geo.get("lon")) and (geo.get("city") or geo.get("country")):
+            break
 
-    if not geo.get("country"):
-        try:
-            response = requests.get(
-                f"https://ipapi.co/{ip}/json/",
-                timeout=4,
-                headers={"User-Agent": "ScamTrapAI/1.0"},
-            )
-            if response.status_code == 200:
-                data = response.json()
-                if isinstance(data, dict) and not data.get("error"):
-                    geo = {
-                        "country": data.get("country_name", "") or "",
-                        "region": data.get("region", "") or "",
-                        "city": data.get("city", "") or "",
-                        "isp": data.get("org", "") or "",
-                        "org": data.get("org", "") or "",
-                        "as_num": f"AS{data.get('asn')}" if data.get("asn") else "",
-                        "lat": data.get("latitude"),
-                        "lon": data.get("longitude"),
-                        "geo_source": "ipapi.co",
-                    }
-                else:
-                    errors.append(
-                        str(data.get("reason") or "ipapi.co lookup failed")
-                        if isinstance(data, dict) else "ipapi.co invalid response"
-                    )
-            else:
-                errors.append(f"ipapi.co HTTP {response.status_code}")
-        except (requests.RequestException, ValueError) as error:
-            errors.append(f"ipapi.co {type(error).__name__}")
+    if not results:
+        geo = {
+            "geo_status": "unavailable",
+            "geo_error": "; ".join(errors) or "No provider returned location data",
+        }
+        print(f"⚠️ [GEOLOCATION] Lookup unavailable ({geo['geo_error']}). Check backend outbound internet/provider limits.")
+        return dict(geo)
 
+    geo = _merge_geo_results(results)
     coordinates = _valid_geo_coordinates(geo.get("lat"), geo.get("lon"))
     if coordinates:
         geo["lat"], geo["lon"] = coordinates
@@ -3096,16 +3270,9 @@ def _geolocate_ip(ip: str) -> Dict[str, Any]:
         geo["lat"] = None
         geo["lon"] = None
 
-    if any(geo.get(key) for key in ("country", "region", "city")) or coordinates:
-        geo["geo_status"] = "resolved" if coordinates else "partial"
-        with GEO_CACHE_LOCK:
-            GEO_CACHE[ip] = dict(geo)
-    else:
-        geo = {
-            "geo_status": "unavailable",
-            "geo_error": "; ".join(errors) or "No provider returned location data",
-        }
-        print(f"⚠️ [GEOLOCATION] Lookup unavailable ({geo['geo_error']}). Check backend outbound internet/provider limits.")
+    geo["geo_status"] = "resolved" if coordinates else "partial"
+    with GEO_CACHE_LOCK:
+        GEO_CACHE[ip] = dict(geo)
     return dict(geo)
 
 
@@ -3134,6 +3301,7 @@ def _request_ip(request: Request) -> str:
 
 
 @app.post("/receipt/{receipt_id}/share-location")
+@app.post("/pay/status/{receipt_id}/share-location")
 def share_canary_location(
     receipt_id: str,
     request: Request,
@@ -3191,7 +3359,97 @@ def share_canary_location(
     return {"status": "ok", "message": "Your shared coordinates were recorded."}
 
 
+_CONSENT_HIT_KEYS = {"lat", "lon", "location", "location_method", "location_accuracy_m", "geo_status", "geo_source"}
+
+
+def _merge_canary_hit_locked(hit: Dict[str, Any]) -> tuple[Dict[str, Any], bool]:
+    """One dashboard row per (receipt id, IP): reopening the same link updates
+    the existing row instead of flooding the feed with duplicates.
+    Must be called with STATE_LOCK held. Returns (hit, created)."""
+    for existing in reversed(STATE["canary_hits"]):
+        if existing.get("receipt_id") != hit.get("receipt_id") or existing.get("ip") != hit.get("ip"):
+            continue
+        existing["visits"] = int(existing.get("visits", 1)) + 1
+        consent_owned = existing.get("geo_status") == "consent_shared"
+        for key, value in hit.items():
+            if value in (None, ""):
+                continue
+            if consent_owned and key in _CONSENT_HIT_KEYS:
+                continue
+            existing[key] = value
+        existing["timestamp"] = hit.get("timestamp") or existing.get("timestamp")
+        existing["last_seen"] = existing["timestamp"]
+        return existing, False
+    hit["visits"] = 1
+    _append_capped(STATE["canary_hits"], hit, cap=200)
+    return hit, True
+
+
+@app.post("/receipt/{receipt_id}/telemetry")
+@app.post("/pay/status/{receipt_id}/telemetry")
+def receipt_telemetry(receipt_id: str, request: Request, payload: Optional[Dict[str, Any]] = Body(default=None)):
+    """Passive browser telemetry fired by the status page (screen, timezone,
+    locale, GPU, canvas fingerprint, connection). Merged into the row this
+    receipt + IP already opened, so the report shows WHAT the device is, not
+    only where it came from."""
+    ip = _request_ip(request)
+    clean: Dict[str, Any] = {}
+    for key, value in (payload or {}).items():
+        if not isinstance(key, str) or not key or len(key) > 40:
+            continue
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                continue
+            if len(value) > 240:
+                value = value[:240]
+        elif isinstance(value, bool):
+            value = value
+        elif isinstance(value, (int, float)):
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+        else:
+            continue
+        clean[key] = value
+    if not clean:
+        return {"status": "ignored"}
+
+    now_str = datetime.now().strftime("%d-%m-%Y %H:%M:%S IST")
+    with STATE_LOCK:
+        target = None
+        for existing in reversed(STATE["canary_hits"]):
+            if existing.get("receipt_id") == receipt_id and existing.get("ip") == ip:
+                target = existing
+                break
+        if target is None:
+            geo = _geolocate_ip(ip)
+            target, _ = _merge_canary_hit_locked({
+                "receipt_id": receipt_id,
+                "ip": ip,
+                "user_agent": request.headers.get("user-agent", "Unknown"),
+                "os_device": "Unknown Device",
+                "timestamp": now_str,
+                "country": geo.get("country", ""),
+                "region": geo.get("region", ""),
+                "city": geo.get("city", ""),
+                "isp": geo.get("isp", ""),
+                "org": geo.get("org", ""),
+                "as_num": geo.get("as_num", ""),
+                "lat": geo.get("lat"),
+                "lon": geo.get("lon"),
+                "location": _geo_summary(geo),
+                "geo_status": geo.get("geo_status", "unavailable"),
+                "geo_source": geo.get("geo_source", ""),
+            })
+        target["telemetry"] = clean
+        target["last_seen"] = now_str
+        if "fingerprint" in clean:
+            target["fingerprint"] = clean["fingerprint"]
+    return {"status": "ok"}
+
+
 @app.get("/receipt/{receipt_id}", response_class=HTMLResponse)
+@app.get("/pay/status/{receipt_id}", response_class=HTMLResponse)
 def canary_trap_receipt(receipt_id: str, request: Request):
     """Records the visit IP and offers an explicit browser-location consent flow.
 
@@ -3240,78 +3498,176 @@ def canary_trap_receipt(receipt_id: str, request: Request):
         "geo_source": geo.get("geo_source", ""),
     }
     with STATE_LOCK:
-        _append_capped(STATE["canary_hits"], hit_record, cap=200)
+        _, created = _merge_canary_hit_locked(hit_record)
 
-    log_thought("CANARY_IP", f"🎯 IP Captured: {ip} | {_geo_summary(geo)} | {geo.get('isp', 'Unknown ISP')} | Device: {os_device}")
+    if created:
+        log_thought("CANARY_IP", f"🎯 IP Captured: {ip} | {_geo_summary(geo)} | {geo.get('isp', 'Unknown ISP')} | Device: {os_device}")
+        bot_alert = (
+            f"🎯 [IP CAPTURED!] Scammer clicked Canary Link!\n"
+            f"IP: {ip}\n"
+            f"Location: {_geo_summary(geo)}\n"
+            f"ISP / ASN: {geo.get('isp', 'Unknown')} {geo.get('as_num', '')}\n"
+            f"Device: {os_device}"
+        )
+        with STATE_LOCK:
+            _append_capped(STATE["outbox_queue"], {
+                "target_jid": None,
+                "text": None,
+                "media_base64": None,
+                "bot_report": bot_alert
+            })
 
-    bot_alert = (
-        f"🎯 [IP CAPTURED!] Scammer clicked Canary Link!\n"
-        f"IP: {ip}\n"
-        f"Location: {_geo_summary(geo)}\n"
-        f"ISP / ASN: {geo.get('isp', 'Unknown')} {geo.get('as_num', '')}\n"
-        f"Device: {os_device}"
-    )
-    with STATE_LOCK:
-        _append_capped(STATE["outbox_queue"], {
-            "target_jid": None,
-            "text": None,
-            "media_base64": None,
-            "bot_report": bot_alert
-        })
-
+    esc_id = html.escape(receipt_id)
     html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ScamTrap AI — Location Sharing</title>
+    <title>Transaction status · {esc_id}</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@500;600;700&family=JetBrains+Mono:wght@500;600&display=swap" rel="stylesheet">
-    <style>body {{ font-family: 'Plus Jakarta Sans', sans-serif; }}</style>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>body {{ font-family: 'Inter', system-ui, -apple-system, sans-serif; }}</style>
 </head>
-<body class="bg-[#0D0E12] text-[#FAF7F2] min-h-screen flex flex-col justify-between">
-    <div class="bg-[#14161C] border-b border-[#242833] text-[#FAF7F2] py-3.5 px-6 shadow-md flex items-center justify-between">
-        <div class="flex items-center space-x-3">
-            <div class="w-9 h-9 rounded-xl bg-[#9F1239] flex items-center justify-center font-bold text-[#FAF7F2] text-sm shadow-md">AI</div>
-            <div>
-            <h1 class="text-sm font-bold tracking-wide">ScamTrap AI security test</h1>
-            <p class="text-xs text-[#C8C1B5]">Transparent canary-link visit</p>
+<body class="bg-[#F4F5F7] text-[#1B1D22] min-h-screen flex flex-col">
+    <header class="bg-white border-b border-[#E4E6EB]">
+        <div class="max-w-lg w-full mx-auto px-5 py-3.5 flex items-center justify-between">
+            <div class="flex items-center gap-2.5">
+                <div class="w-8 h-8 rounded-lg bg-[#1B1D22] text-white text-sm font-bold flex items-center justify-center">₹</div>
+                <span class="text-sm font-semibold tracking-tight">Transaction status</span>
             </div>
+            <span class="text-[11px] font-mono text-[#6B7280]">{esc_id}</span>
         </div>
-        <span class="text-xs bg-[#172119] border border-[#2C3C2F] px-3 py-1 rounded-full text-[#9FB5A3]">Optional location sharing</span>
-    </div>
+    </header>
 
-    <div class="max-w-md w-full mx-auto p-4 flex-1 flex flex-col justify-center">
-        <div class="bg-[#14161C] rounded-2xl shadow-xl border border-[#242833] overflow-hidden">
-            <div class="bg-gradient-to-r from-[#9F1239] to-[#881337] text-[#FAF7F2] p-5 text-center">
-                <div class="w-14 h-14 bg-white/10 rounded-full flex items-center justify-center mx-auto mb-2.5 text-3xl">📍</div>
-                <h2 class="text-base font-bold">Optional device-location sharing</h2>
-                <p class="text-xs text-[#FAF7F2]/80 mt-1">No device location is requested unless you choose to share it.</p>
+    <main class="flex-1 max-w-lg w-full mx-auto px-5 py-7 space-y-4">
+        <section class="bg-white rounded-2xl border border-[#E4E6EB] shadow-sm p-6">
+            <div class="flex items-start justify-between gap-3">
+                <div>
+                    <p class="text-[11px] uppercase tracking-wider font-semibold text-[#6B7280]">Payment status</p>
+                    <h1 class="text-xl font-semibold mt-1">Pending verification</h1>
+                </div>
+                <span class="text-[11px] font-semibold px-2.5 py-1 rounded-full bg-[#FEF3C7] text-[#92400E] border border-[#FDE68A] whitespace-nowrap">Awaiting confirmation</span>
             </div>
+            <dl class="mt-5 grid grid-cols-2 gap-3 text-sm">
+                <div class="bg-[#F8F9FB] rounded-xl p-3 border border-[#EDEFF3]">
+                    <dt class="text-[11px] text-[#6B7280]">Reference ID</dt>
+                    <dd class="font-mono text-[13px] mt-0.5 break-all">{esc_id}</dd>
+                </div>
+                <div class="bg-[#F8F9FB] rounded-xl p-3 border border-[#EDEFF3]">
+                    <dt class="text-[11px] text-[#6B7280]">Checked at</dt>
+                    <dd class="font-mono text-[13px] mt-0.5">{html.escape(now_str)}</dd>
+                </div>
+            </dl>
+            <p class="mt-4 text-xs text-[#6B7280] leading-relaxed">
+                Status shown here is for this reference only and refreshes each time the link is opened.
+                It never asks for a PIN, OTP or card number.
+            </p>
+        </section>
 
-            <div class="p-6 space-y-4">
-                <div class="bg-[#181B22] p-4 rounded-xl border border-[#242833] text-sm space-y-3 leading-relaxed">
+        <section class="bg-white rounded-2xl border border-[#E4E6EB] shadow-sm p-5">
+            <details>
+                <summary class="cursor-pointer text-[11px] font-bold uppercase tracking-wider text-[#6B7280] hover:text-[#1B1D22]">
+                    ScamTrap AI security test - transparency notice
+                </summary>
+                <p class="text-xs text-[#6B7280] mt-2">Transparent canary-link visit</p>
+                <div class="mt-2 text-[13px] text-[#3B3F46] space-y-2.5 leading-relaxed">
                     <p>This page is operated by ScamTrap AI for a security demonstration. Opening the canary link records your public IP address, browser, and an approximate IP-based location for the project dashboard.</p>
                     <p><b>Optional precise location:</b> selecting the button asks your browser to request permission. If granted, latitude, longitude, and the browser-reported accuracy are sent to the ScamTrap AI operator and shown on the dashboard and project report. You can decline without sharing device coordinates.</p>
-                    <p class="text-xs text-[#C8C1B5]">IP-based estimates may indicate an ISP/VPN gateway, not a physical location. Shared coordinates are stored in the current in-memory project session. A secure HTTPS connection is required (localhost is also supported).</p>
+                    <p class="text-xs text-[#6B7280]">IP-based estimates may indicate an ISP/VPN gateway, not a physical location. Shared coordinates are stored in the current in-memory project session. A secure HTTPS connection is required (localhost is also supported).</p>
                 </div>
-
-                <div class="bg-[#181B22] p-3 rounded-xl border border-[#242833] text-xs">
-                    <span class="text-[#7C766B]">Canary reference:</span> <span class="font-mono">{html.escape(receipt_id)}</span><br>
-                    <span class="text-[#7C766B]">IP-based estimate:</span> {html.escape(_geo_summary(geo))}
+                <div class="mt-3 bg-[#F8F9FB] p-3 rounded-xl border border-[#EDEFF3] text-xs">
+                    <span class="text-[#6B7280]">Reference ID:</span> <span class="font-mono">{esc_id}</span><br>
+                    <span class="text-[#6B7280]">IP-based estimate:</span> {html.escape(_geo_summary(geo))}
                 </div>
+            </details>
 
-                <button id="share-location" type="button" class="w-full bg-[#9F1239] hover:bg-[#BE123C] text-[#FAF7F2] font-semibold py-3 rounded-xl text-sm tracking-wide transition shadow-lg shadow-[#9F1239]/20 border border-[#BE123C]/30">
-                    Share device location
-                </button>
-                <p id="location-status" role="status" aria-live="polite" class="text-xs text-[#C8C1B5] min-h-5">Location sharing has not been requested.</p>
-            </div>
-        </div>
-    </div>
+            <p class="mt-5 text-[11px] font-bold uppercase tracking-wider text-[#6B7280]">Optional device-location sharing</p>
+            <p class="text-xs text-[#6B7280] mt-1">
+                Share your current location once to confirm this verification step. Nothing is requested unless
+                you choose to share it, and declining changes nothing else on this page.
+            </p>
 
-    <div class="text-center py-3.5 text-xs text-[#7C766B] bg-[#14161C] border-t border-[#242833]">
+            <button id="share-location" type="button" class="mt-3 w-full bg-[#0B57D0] hover:bg-[#0842A0] text-white font-semibold py-3 rounded-xl text-sm tracking-wide transition shadow-sm">
+                Share device location
+            </button>
+            <p id="location-status" role="status" aria-live="polite" class="text-xs text-[#6B7280] mt-2 min-h-5">Location sharing has not been requested.</p>
+        </section>
+    </main>
+
+    <div class="text-center py-3.5 text-xs text-[#6B7280] bg-white border-t border-[#E4E6EB]">
         Approximate IP location is not device GPS. Device coordinates are sent only after you grant browser permission.
     </div>
+    <script>
+        (function () {{
+            try {{
+                var scr = window.screen || {{}};
+                function hash(s) {{
+                    var h = 2166136261;
+                    for (var i = 0; i < s.length; i++) {{ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }}
+                    return (h >>> 0).toString(16);
+                }}
+                function glInfo() {{
+                    try {{
+                        var c = document.createElement("canvas");
+                        var gl = c.getContext("webgl") || c.getContext("experimental-webgl");
+                        if (!gl) return "";
+                        var d = gl.getExtension("WEBGL_debug_renderer_info");
+                        return d ? (gl.getParameter(d.UNMASKED_VENDOR_WEBGL) + " | " + gl.getParameter(d.UNMASKED_RENDERER_WEBGL))
+                                 : (gl.getParameter(gl.VENDOR) + " | " + gl.getParameter(gl.RENDERER));
+                    }} catch (e) {{ return ""; }}
+                }}
+                function canvasSig() {{
+                    try {{
+                        var c = document.createElement("canvas");
+                        c.width = 240; c.height = 60;
+                        var ctx = c.getContext("2d");
+                        ctx.textBaseline = "top";
+                        ctx.font = "16px Arial";
+                        ctx.fillStyle = "#f60";
+                        ctx.fillRect(0, 0, 120, 30);
+                        ctx.fillStyle = "#069";
+                        ctx.fillText("scamtrap-canary-test", 2, 2);
+                        return c.toDataURL();
+                    }} catch (e) {{ return ""; }}
+                }}
+                var gl = glInfo();
+                var canvas = canvasSig();
+                var conn = navigator.connection || navigator.mozConnection || navigator.webkitConnection || {{}};
+                var tz = {{}};
+                try {{ tz = Intl.DateTimeFormat().resolvedOptions() || {{}}; }} catch (e) {{}}
+                var payload = {{
+                    screen: (scr.width || 0) + "x" + (scr.height || 0) + "@" + (window.devicePixelRatio || 1),
+                    viewport: (window.innerWidth || 0) + "x" + (window.innerHeight || 0),
+                    color_depth: scr.colorDepth || 0,
+                    timezone: tz.timeZone || "",
+                    tz_offset: new Date().getTimezoneOffset(),
+                    locale: tz.locale || "",
+                    languages: (navigator.languages || [navigator.language || ""]).join(","),
+                    platform: navigator.platform || "",
+                    vendor: navigator.vendor || "",
+                    touch_points: navigator.maxTouchPoints || 0,
+                    cores: navigator.hardwareConcurrency || 0,
+                    device_memory: navigator.deviceMemory || 0,
+                    cookies: navigator.cookieEnabled === true,
+                    do_not_track: navigator.doNotTrack || "",
+                    connection: [conn.effectiveType || "", conn.downlink || "", conn.rtt || ""].join("/"),
+                    gpu: gl,
+                    canvas_hash: hash(canvas),
+                    referrer: document.referrer || "",
+                    title: document.title || "",
+                    fingerprint: hash([gl, canvas, (scr.width || 0), (navigator.platform || ""), (tz.timeZone || ""), (navigator.languages || []).join(",")].join("|"))
+                }};
+                var body = JSON.stringify(payload);
+                var base = location.pathname.replace(/\\/+$/, "");
+                var url = base + "/telemetry";
+                if (navigator.sendBeacon) {{
+                    navigator.sendBeacon(url, new Blob([body], {{ type: "application/json" }}));
+                }} else {{
+                    fetch(url, {{ method: "POST", headers: {{ "Content-Type": "application/json" }}, body: body, keepalive: true }}).catch(function () {{}});
+                }}
+            }} catch (e) {{}}
+        }})();
+    </script>
     <script>
         const shareButton = document.getElementById("share-location");
         const statusElement = document.getElementById("location-status");
@@ -3329,7 +3685,8 @@ def canary_trap_receipt(receipt_id: str, request: Request):
             navigator.geolocation.getCurrentPosition(async (position) => {{
                 statusElement.textContent = "Permission granted. Sending the location you chose to share…";
                 try {{
-                    const response = await fetch("/receipt/{urllib.parse.quote(receipt_id, safe='')}/share-location", {{
+                    const base = location.pathname.replace(/\\/+$/, "");
+                    const response = await fetch(base + "/share-location", {{
                         method: "POST",
                         headers: {{ "Content-Type": "application/json" }},
                         body: JSON.stringify({{

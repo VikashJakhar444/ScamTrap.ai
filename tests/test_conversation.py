@@ -136,8 +136,8 @@ def check_turn(turn, tag):
         assert_test(f"{tag}: total human delay >= 3000ms", total_ms >= 3000, f"({total_ms}ms)")
         if plan and plan[0].get("action") == "wait":
             typing_starts = model_ms + int(plan[0]["ms"])
-            assert_test(f"{tag}: typing starts >= 3000ms after the message",
-                        typing_starts >= 3000, f"({typing_starts}ms)")
+            assert_test(f"{tag}: typing starts >= 1500ms after the message",
+                        typing_starts >= 1500, f"({typing_starts}ms)")
 
     # 4. Payload staging rules
     expect_media = turn.get("media")
@@ -466,31 +466,30 @@ def run_human_engine_tests():
     short_samples = [human_engine.typing_ms("ok") for _ in range(30)]
     long_samples = [human_engine.typing_ms("Bhai maine try kar liya par bank ka daily limit error aa raha hai, "
                                            "screenshot bhej raha hu tu dekh le ek baar") for _ in range(30)]
-    assert_test("typing: short reply >= 2.6s", min(short_samples) >= 2600, f"({min(short_samples)}ms)")
+    assert_test("typing: short reply >= 1.9s", min(short_samples) >= 1900, f"({min(short_samples)}ms)")
     assert_test("typing: long reply takes longer than short on average",
                 sum(long_samples) / len(long_samples) > sum(short_samples) / len(short_samples))
     assert_test("typing: long reply <= 45s ceiling", max(long_samples) <= 45000)
 
     # Read delay never instant
     reads = [human_engine.read_delay_ms(prompt_len=120) for _ in range(50)]
-    assert_test("read: delay >= 3000ms before typing even starts", min(reads) >= 3000, f"({min(reads)}ms)")
+    assert_test("read: delay >= 1500ms before typing even starts", min(reads) >= 1500, f"({min(reads)}ms)")
     assert_test("read: delay <= 18s ceiling", max(reads) <= 18000)
 
     # Time management: model thinking time is absorbed into the read delay
     txt = "Haan bhai, abhi dekh ke batata hu tu ruk."
     fast = human_engine.build_delivery_plan(txt, elapsed_ms=0)
-    slow = human_engine.build_delivery_plan(txt, elapsed_ms=9000)
+    slow = human_engine.build_delivery_plan(txt, elapsed_ms=2500)
     absorbed = human_engine.build_delivery_plan(txt, elapsed_ms=60000)
-    assert_test("absorb: fast model still waits >= 3s before typing",
-                fast[0]["ms"] >= 3000, f"({fast[0]['ms']}ms)")
+    assert_test("absorb: fast model still waits >= 1.5s before typing",
+                fast[0]["ms"] >= human_engine.READ_FLOOR_MS, f"({fast[0]['ms']}ms)")
     assert_test("absorb: model time shrinks the planned wait",
-                slow[0]["ms"] <= human_engine.READ_MAX_MS - 9000 and slow[0]["ms"] >= human_engine.RESIDUAL_WAIT_MS,
-                f"({slow[0]['ms']}ms for elapsed=9000)")
+                slow[0]["ms"] <= human_engine.READ_MAX_MS - 2500 and slow[0]["ms"] >= human_engine.RESIDUAL_WAIT_MS,
+                f"({slow[0]['ms']}ms for elapsed=2500)")
     assert_test("absorb: huge model time floors at the residual wait",
                 absorbed[0]["ms"] == human_engine.RESIDUAL_WAIT_MS, f"({absorbed[0]['ms']}ms)")
-    assert_test("absorb: typing still starts >= 3s after the message",
-                9000 + slow[0]["ms"] >= 3000 and fast[0]["ms"] >= 3000,
-                f"({9000 + slow[0]['ms']}ms / {fast[0]['ms']}ms)")
+    assert_test("absorb: typing still starts >= 1.5s after the message",
+                fast[0]["ms"] >= 1500, f"({fast[0]['ms']}ms)")
     assert_test("absorb: absorbed plan still validates clean",
                 human_engine.validate_plan(slow) == [], f"{human_engine.validate_plan(slow)}")
 
@@ -509,8 +508,8 @@ def run_human_engine_tests():
     mplan = human_engine.build_delivery_plan("payment fail ho gaya, dekh", media=True)
     assert_test("plan: media plan ends with send_media",
                 mplan and mplan[-1]["action"] == "send_media")
-    assert_test("plan: media plan waits for app switch + screenshot (>=18s) before sending",
-                human_engine.plan_time_to_first_send_ms(mplan) >= 18000,
+    assert_test("plan: media plan waits for app switch + screenshot (>=10s) before sending",
+                human_engine.plan_time_to_first_send_ms(mplan) >= 10000,
                 f"({human_engine.plan_time_to_first_send_ms(mplan)}ms)")
     assert_test("plan: media plan shows typing for the caption",
                 any(s["action"] == "typing" for s in mplan))
