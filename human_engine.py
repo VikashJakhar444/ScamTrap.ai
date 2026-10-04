@@ -6,9 +6,9 @@ never be fingerprinted as a bot:
 
 1. READ DELAY     - nobody answers the instant a message lands. A human picks
                     up the phone, reads, thinks, then starts typing.
-2. TYPING SPEED   - thumb typing on a phone runs roughly 150-330 ms per
-                    character with extra hesitation between words. Long
-                    messages therefore take tens of seconds, never 1 second.
+2. TYPING SPEED   - thumb typing on a phone runs roughly 45-100 ms per
+                    character with extra hesitation between words, so long
+                    messages still take a few seconds, never 1.
 3. BUBBLE SPLIT   - humans fire off 1-3 short messages, not one giant wall
                     of text.
 4. PAUSES         - the typing indicator flickers off mid-message while the
@@ -29,28 +29,28 @@ from typing import Any, Dict, List, Optional
 # ---------------------------------------------------------------------
 # Tunable human ranges (milliseconds unless stated otherwise)
 # ---------------------------------------------------------------------
-READ_DELAY_RANGE = (3200, 7500)       # pickup + read + think, before typing
-READ_FLOOR_MS = 3000                  # a real human never answers in under ~3s
-READ_PER_CHAR_MS = 14                 # longer message -> longer read
-READ_MAX_MS = 18000
-RESIDUAL_WAIT_MS = 700                # wait left after "thinking time" is absorbed
+READ_DELAY_RANGE = (1600, 3600)       # pickup + read + think, before typing
+READ_FLOOR_MS = 1500                  # a real human never answers instantly
+READ_PER_CHAR_MS = 6                  # longer message -> longer read
+READ_MAX_MS = 9000
+RESIDUAL_WAIT_MS = 350                # wait left after "thinking time" is absorbed
 
-TYPING_BASE_MS = (600, 1400)          # unlock, open chat, focus field
-TYPING_PER_CHAR_MS = (0.15, 0.33)     # 3-6.7 chars/sec thumb typing
-TYPING_PER_WORD_MS = (40, 180)        # hesitation between words
-TYPING_MIN_MS = 2600
-TYPING_MAX_MS = 45000
+TYPING_BASE_MS = (400, 900)           # unlock, open chat, focus field
+TYPING_PER_CHAR_MS = (0.045, 0.10)    # quick but still human thumb typing
+TYPING_PER_WORD_MS = (15, 55)         # hesitation between words
+TYPING_MIN_MS = 1900
+TYPING_MAX_MS = 20000
 
-INTER_BUBBLE_GAP_MS = (900, 3800)     # pause between two messages
-MID_PAUSE_CHANCE = 0.22               # typing flickers off mid-message
-MID_PAUSE_RANGE = (2200, 6500)
+INTER_BUBBLE_GAP_MS = (600, 1800)     # pause between two messages
+MID_PAUSE_CHANCE = 0.15               # typing flickers off mid-message
+MID_PAUSE_RANGE = (1200, 2800)
 
-MAX_BUBBLE_CHARS = 150                # one WhatsApp bubble cap
+MAX_BUBBLE_CHARS = 110                # one WhatsApp bubble cap
 MAX_BUBBLES = 3
 
 # Screenshot ("payment failed") narrative
-APP_SWITCH_RANGE = (18000, 27000)     # leave WhatsApp, open GPay/PhonePe, try txn
-SCREENSHOT_RANGE = (2500, 5500)       # error pops, screenshot taken, back to WA
+APP_SWITCH_RANGE = (7000, 11000)      # leave WhatsApp, open GPay/PhonePe, try txn
+SCREENSHOT_RANGE = (1500, 3000)       # error pops, screenshot taken, back to WA
 
 
 def split_bubbles(
@@ -107,9 +107,9 @@ def read_delay_ms(prompt_len: int = 0, pace: float = 1.0) -> int:
     answers instantly, and the model's own thinking time lives inside this
     window (see build_delivery_plan(elapsed_ms=...))."""
     base = random.uniform(*READ_DELAY_RANGE) + min(int(prompt_len or 0), 400) * READ_PER_CHAR_MS
-    # 12% of the time the victim is distracted (busy, away, reading something else)
-    if random.random() < 0.12:
-        base += random.uniform(4000, 14000)
+    # 10% of the time the victim is distracted (busy, away, reading something else)
+    if random.random() < 0.10:
+        base += random.uniform(2500, 7000)
     return int(max(READ_FLOOR_MS * pace, min(base * pace, READ_MAX_MS)))
 
 
@@ -132,7 +132,7 @@ def typing_ms(text: str, pace: float = 1.0) -> int:
     ms *= pace
     # Occasional "confused pause" while composing a tricky sentence
     if len(text) > 60 and random.random() < 0.15:
-        ms += random.uniform(2000, 7000)
+        ms += random.uniform(1500, 4000)
     return int(max(TYPING_MIN_MS, min(ms, TYPING_MAX_MS)))
 
 
@@ -187,9 +187,12 @@ def build_delivery_plan(
     for i, bubble in enumerate(bubbles):
         planned_typing = typing_ms(bubble, pace)
         # Typing indicator flickers off mid-way while the person re-reads.
-        if len(bubble) > 70 and random.random() < MID_PAUSE_CHANCE:
-            first = int(planned_typing * random.uniform(0.4, 0.65))
-            second = max(TYPING_MIN_MS // 2, planned_typing - first)
+        # Only worth splitting when both halves still read as human typing.
+        first = second = 0
+        if len(bubble) > 70 and planned_typing >= 4200 and random.random() < MID_PAUSE_CHANCE:
+            first = max(1800, int(planned_typing * random.uniform(0.4, 0.65)))
+            second = planned_typing - first
+        if first and second >= 1800:
             plan.append({"action": "typing", "ms": first})
             plan.append({"action": "clear_state"})
             plan.append({"action": "wait", "ms": int(random.uniform(*MID_PAUSE_RANGE))})

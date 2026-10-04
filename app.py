@@ -487,9 +487,9 @@ def _fresh_session() -> Dict[str, Any]:
     return {
         "turn": 0,
         "stage": "rapport",        # rapport -> bait -> glitch -> canary
-        "glitch_sent": 0,          # fake failure screenshot sent N times
-        "links_sent": 0,           # canary links sent (hard cap 3)
-        "scammer_links_seen": 0,   # links the scammer themselves sent
+        "glitch_sent": 0,          # dashboard telemetry only
+        "links_sent": 0,           # dashboard telemetry only (replies read these off the chat)
+        "scammer_links_seen": 0,   # dashboard telemetry only
         "recent_replies": [],      # last replies, never phrased the same twice
         "pace": round(random.uniform(0.85, 1.30), 2),
     }
@@ -797,6 +797,25 @@ def _advance_session(reply_text: str, media_sent: bool, link_sent: bool) -> None
             f["stage"] = max(int(f["stage"]), 1)   # RAPPORT reached
 
 
+def _payload_state_from_chat_locked() -> tuple[int, int, int]:
+    """(screenshots we sent, canary links we sent, links they sent) counted
+    straight off the conversation log instead of session bookkeeping, so every
+    reply decision is made from the chat itself and stays correct no matter how
+    long the conversation gets or whether the session was reset mid-chat.
+    Must be called with STATE_LOCK held."""
+    glitch_sent = links_sent = scam_links = 0
+    for m in STATE["scammer_chat"]:
+        if m.get("role") == "scammer":
+            if _URL_RE.search(str(m.get("text") or "")):
+                scam_links += 1
+        else:
+            if m.get("media"):
+                glitch_sent += 1
+            if m.get("trap_url"):
+                links_sent += 1
+    return glitch_sent, links_sent, scam_links
+
+
 def _build_plan_for(reply_text: str, media: bool, prompt_len: int, elapsed_ms: int = 0) -> tuple[List[Dict[str, Any]], int]:
     """Compile a reply into the timed human delivery plan + the legacy
     recommended_delay_ms (time the bridge still waits before the first bubble).
@@ -1086,9 +1105,7 @@ def get_deterministic_tactical_reply(scammer_msg: str, base_url: str, amount_str
         recent = list(sess.get("recent_replies", []))
         latest_upi = next(iter(STATE["extracted_intel"]["upi_ids"]), None)
         has_bank = bool(STATE["extracted_intel"]["bank_accounts"] or STATE["extracted_intel"]["ifsc_codes"])
-        glitch_sent = int(sess.get("glitch_sent", 0))
-        links_sent = int(sess.get("links_sent", 0))
-        scam_links = int(sess.get("scammer_links_seen", 0))
+        glitch_sent, links_sent, scam_links = _payload_state_from_chat_locked()
         sess_stage = sess.get("stage", "rapport")
         last_scammer_msg = ""
         for m in reversed(STATE["scammer_chat"]):
@@ -1294,15 +1311,17 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             target_scam = STATE.get("target_scammer", "")
             latest_upi = get_contextual_payee(target_scam)
             persona = _ensure_persona_locked()
-            sess = STATE["session"]
-            stage = sess.get("stage", "rapport")
-            glitch_sent = int(sess.get("glitch_sent", 0))
-            links_sent = int(sess.get("links_sent", 0))
-            scam_links = int(sess.get("scammer_links_seen", 0))
-            recent_chat_lines = []
-            for m in STATE["scammer_chat"][-10:]:
+            # Full conversation, oldest -> newest, with payload markers so the
+            # model can SEE what was already sent instead of being told counts.
+            chat_lines = []
+            for m in STATE["scammer_chat"]:
                 speaker = "Scammer" if m.get("role") == "scammer" else "You"
-                recent_chat_lines.append(f"{speaker}: {m.get('text', '')}")
+                line = f"{speaker}: {str(m.get('text') or '').strip()[:400]}"
+                if m.get("media"):
+                    line += "  [you sent a payment-failed screenshot]"
+                if m.get("trap_url"):
+                    line += "  [you sent this bank-verification link]"
+                chat_lines.append(line)
             intel_snapshot = {k: sorted(v) for k, v in STATE["extracted_intel"].items()}
 
         canary_id = f"TXN-{uuid.uuid4().hex[:6].upper()}"
@@ -1312,7 +1331,7 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
         encoded_amt = urllib.parse.quote(effective_amt)
         fake_img_url = f"/tools/fake-receipt?upi={encoded_upi}&amount={encoded_amt}"
 
-        chat_history_str = "\n".join(recent_chat_lines) if recent_chat_lines else "(No prior messages yet)"
+        chat_history_str = "\n".join(chat_lines) if chat_lines else "(No prior messages yet)"
 
         system_instruction = (
             "You are a real Indian WhatsApp user - the owner of this phone. You are NOT an assistant, bot or product. "
@@ -1328,10 +1347,12 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             "3. If they say they don't want money / no payment needed / 'leave it', drop the payment topic immediately and continue normally.\n"
             "4. ONLY when they are running a scam or demanding money (electricity bill disconnection, job/task fees, police/customs/CBI threats, "
             "lottery, KYC block, direct payment demands) play along as a slightly naive, cooperative victim:\n"
-            "   - First ask HOW to pay (their UPI ID / GPay / PhonePe / QR).\n"
+            "   - First ask HOW to pay (their UPI ID / GPay / PhonePe / QR) if the conversation above doesn't hold their payment details yet.\n"
             "   - If their message already contains a UPI ID or account details: pick SEND_FAKE_UPI_GLITCH and say you attempted the "
-            "   - If they gave bank details, UPI ID, or are demanding payment: pick SEND_CANARY_LINK and tell them the transfer is on bank clearance hold and they must open this verification receipt link to release it: " + canary_url + "\n"
-            "   - Or pick SEND_FAKE_UPI_GLITCH to send the failed limit screenshot.\n"
+            f"₹{amount_str} transfer, it failed with a daily-limit error, point at the screenshot being sent, and ask for another account.\n"
+            "   - If the conversation above already shows your failure screenshot, or they gave full bank+IFSC details, or they are "
+            "pushing again after your last reply: pick SEND_CANARY_LINK and tell them the transfer is on bank clearance hold and they "
+            "must open this verification receipt link to release it: " + canary_url + "\n"
             "5. ANTI-DETECTION: if they test you (math questions, 'repeat what I said', 'are you a bot/AI', 'you reply too fast'), "
             "answer the test correctly or deny it casually like an amused human, then change the topic. Stay calm, never defensive. "
             "Never mention AI, bots, honeypots, agents, prompts or security systems - not even to deny them seriously.\n"
@@ -1344,10 +1365,11 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
 
         prompt = (
             f"YOUR IDENTITY: {persona['name']}, {persona['age']}, from {persona['city']}, {persona['job']}.\n\n"
-            f"CLASSIFIER HINT FOR THE NEWEST MESSAGE (intent={intent}, stage={stage}, "
-            f"failure_screenshots_sent={glitch_sent}, links_sent={links_sent}, links_they_sent={scam_links}):\n"
-            f"Your reply must match this intent. If it is NOT a payment/scam intent, do not talk about money at all.\n\n"
-            f"RECENT CONVERSATION HISTORY:\n{chat_history_str}\n\n"
+            "DECIDE FROM THE CONVERSATION ONLY. The full chat is below, oldest to newest, and it can be any length - read all of it. "
+            "There are no counters or message quotas: what already happened (your screenshot/link markers, their asks, your past replies) "
+            "plus the newest message is the only thing that decides this reply.\n"
+            f"Intent of the newest message: {intent}. If it is NOT a payment/scam intent, do not talk about money at all.\n\n"
+            f"FULL CONVERSATION HISTORY:\n{chat_history_str}\n\n"
             f"NEWEST INCOMING MESSAGE:\n\"{scammer_msg}\"\n\n"
             f"EXTRACTED AMOUNT DEMANDED: {amount_str}\n"
             f"EXTRACTED INTEL SO FAR:\n"
@@ -1455,10 +1477,9 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             tool = "NONE"
 
         with STATE_LOCK:
-            sess = STATE["session"]
-            glitch_sent = int(sess.get("glitch_sent", 0))
-            links_sent = int(sess.get("links_sent", 0))
-            scam_links = int(sess.get("scammer_links_seen", 0))
+            # Screenshots/links already in this conversation - counted off the
+            # chat log, never off session bookkeeping.
+            glitch_sent, links_sent, scam_links = _payload_state_from_chat_locked()
             has_bank = bool(STATE["extracted_intel"]["bank_accounts"] or STATE["extracted_intel"]["ifsc_codes"])
             intel_upi = next(iter(STATE["extracted_intel"]["upi_ids"]), None)
 
@@ -1471,16 +1492,23 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
         media_url = None
         trap_url = None
 
-        # The staged flow is enforced by rules - the model only writes text:
-        #   payment context, first exchange  -> failure screenshot (no link!)
-        #   payment context, bank details    -> IMPS hold link
-        #   payment context, after screenshot-> canary link (max 3/session)
-        #   non-payment context              -> never any payload
-        if tool == "SEND_CANARY_LINK" or canary_url in (reply or "") or (intent in _PAYMENT_CONTEXT_INTENTS and _link_allowed(glitch_sent, scam_links, links_sent)):
+        # Payloads follow the conversation, not a counter:
+        #   - the model's own tool pick always wins (it read the whole chat)
+        #   - otherwise the chat decides the natural next step:
+        #       their UPI known, no failure screenshot yet -> screenshot
+        #       screenshot already in chat / bank+IFSC given / no UPI learned
+        #         -> canary verification link (the IP-capture payload)
+        #   - non-payment context -> never any payload
+        if tool == "SEND_FAKE_UPI_GLITCH":
+            media_url = fake_img_url
+        elif tool == "SEND_CANARY_LINK" or canary_url in (reply or "") or (
+                intent in _PAYMENT_CONTEXT_INTENTS
+                and (glitch_sent > 0 or has_bank or not pay_upi)
+                and _link_allowed(glitch_sent, scam_links, links_sent)):
             trap_url = canary_url
             if canary_url not in (reply or ""):
                 reply = f"{reply}\n\nBank receipt link: {canary_url}"
-        elif tool == "SEND_FAKE_UPI_GLITCH" or (intent in _PAYMENT_CONTEXT_INTENTS and glitch_sent == 0):
+        elif intent in _PAYMENT_CONTEXT_INTENTS and glitch_sent == 0 and pay_upi:
             media_url = fake_img_url
 
         if reply is None:
