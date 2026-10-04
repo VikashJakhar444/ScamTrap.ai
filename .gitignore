@@ -1,0 +1,32 @@
+# Environment & Secrets
+.env
+*.env.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# WhatsApp session data & Chromium binaries
+.wwebjs_auth/
+.wwebjs_cache/
+.puppeteer/
+
+# Large Binaries
+cloudflared.exe
+*.exe
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

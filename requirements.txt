@@ -1,0 +1,10 @@
+# ScamTrap AI - Python backend (tested on Python 3.13)
+fastapi==0.142.2
+uvicorn==0.54.0
+pydantic==2.13.5
+google-genai==2.26.0
+pillow==12.3.0
+reportlab==5.0.1
+
+# test_suite.py only
+requests==2.34.2
