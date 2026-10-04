@@ -958,14 +958,14 @@ POOL_NOLINK_EN = [
     "I'm checking the bank app - it says verification pending. Do you have another account?",
 ]
 POOL_BAIT_BILL_HI = [
-    "Arre bijli cut hone wali hai kya? Kitne ka bill pending hai bata, main abhi GPay se check karta hu.",
-    "Acha discom wala message hai? Kaunsa connection number hai aur kitna due hai? UPI ID bhej de abhi kar deta hu.",
-    "Ghabra mat, bata kitna amount hai aur kis UPI pe bhejna hai. Abhi khol raha hu GPay.",
-    "Kaat rahe hai kya light? Bata bill kitne ka hai, mere GPay pe request bhej de main de deta hu.",
+    "Arre kaunsa bill pending hai bhai? Bijli ka ya mobile ka? Kitne ka amount baki hai?",
+    "Bijli cut hone wali hai kya? Kaunsa connection number hai aur kitna due hai batao?",
+    "Acha kiska bill pending hai? Kitna baki hai, mujhe check karke batao?",
+    "Kaat rahe hai kya connection? Batao bill kitne ka hai aur kiska hai?",
 ]
 POOL_BAIT_BILL_EN = [
-    "Oh no, is the power going to be cut? How much is the bill? Send the UPI ID and I'll pay now.",
-    "Which connection number and how much is due? Share the payment UPI, doing it right away.",
+    "Wait, which bill is pending? Electricity or mobile? How much is due?",
+    "Is the connection getting disconnected? Which account number and what is the amount?",
 ]
 POOL_BAIT_JOB_HI = [
     "Arre serious? Ye to badhiya hai. Kaam kya karna padega exactly aur kitna milega?",
@@ -979,7 +979,7 @@ POOL_BAIT_JOB_EN = [
 ]
 POOL_BAIT_THREAT_HI = [
     "Arre police/CBI wale ka message aaya hai? Kya bol rahe hai exactly, bata. Ghabra raha hu thoda.",
-    "Parcel atak gaya? Kitna charge bol rahe hai customs wale? UPI ID de do abhi bhej deta hu.",
+    "Parcel atak gaya? Kaunsa parcel hai aur kitna charge bol rahe hai customs wale?",
     "Kya baat kar raha hai bhai, court notice? Mujhe detail me batao kya likha hai usme.",
     "KYC block ho rahi hai kya? Mere bank wale ko abhi call karta hu... pehle tu bata kya bol rahe hai.",
 ]
@@ -1436,11 +1436,12 @@ def run_hijack_agent(scammer_msg: str, base_url: str) -> tuple[str, str, Optiona
             "In those replies NEVER mention money, payment, UPI, bank, transfers or scams.\n"
             "3. If they say they don't want money / no payment needed / 'leave it', drop the payment topic immediately and continue normally.\n"
             "4. ONLY when they are running a scam or demanding money (electricity bill disconnection, job/task fees, police/customs/CBI threats, "
-            "lottery, KYC block, direct payment demands) play along as a slightly naive, cooperative victim and follow this staged flow, "
-            "which is decided by what the conversation above already contains:\n"
-            "   - No payment details shared yet (no UPI id, no account anywhere above) -> just ask HOW to pay "
+            "lottery, KYC block, direct payment demands) play along as a slightly naive, cooperative victim and follow this staged flow:\n"
+            "   - If they just opened with a vague scam line (e.g., 'bill pending hai', 'parcel arrived', 'job offer', 'threat') without details: "
+            "ask for details first like a normal confused person ('Arre kaunsa bill pending hai? Bijli ka ya kiska? Kitne ka hai?', 'Kaunsa parcel?'). DO NOT immediately ask for a UPI ID.\n"
+            "   - When they state the amount / ask to pay and no payment details are shared yet -> ask WHERE / HOW to pay "
             "(their UPI ID / GPay / PhonePe / QR). Send no screenshot and no link.\n"
-            "   - Their message now contains a UPI id -> pick SEND_FAKE_UPI_GLITCH, say you attempted the "
+            "   - Their message contains a UPI id -> pick SEND_FAKE_UPI_GLITCH, say you attempted the "
             f"₹{amount_str} transfer, it failed with a daily-limit error, point at the screenshot being sent, and ask for another account.\n"
             "   - They gave full bank + IFSC details -> pick SEND_CANARY_LINK and say the IMPS is sitting on a bank clearance hold, "
             "they can release it from this status page: " + canary_url + "\n"
