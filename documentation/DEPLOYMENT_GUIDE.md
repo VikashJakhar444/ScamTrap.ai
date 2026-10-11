@@ -59,7 +59,7 @@ PUBLIC_TUNNEL_URL=""
 
 # Secret API key protecting /api/* from remote callers.
 # Auto-generated on first startup if left blank.
-SCAMTRAP_API_KEY=pUvsYUQGak4ZlfvzR9ma4MuAQa-NRRFv
+SCAMTRAP_API_KEY=""
 
 # Bind Address: Use 127.0.0.1 for local isolation, or 0.0.0.0 for LAN exposure
 HOST=127.0.0.1

@@ -14,10 +14,10 @@ async function run() {
     const lidClient = {
         getContactLidAndPhone: async (ids) => {
             assert.deepEqual(ids, ['213142500053021@lid']);
-            return [{ lid: '213142500053021@lid', pn: '6204257765@c.us' }];
+            return [{ lid: '213142500053021@lid', pn: '9876543210@c.us' }];
         }
     };
-    assert.equal(await resolveSenderNumber(lidMessage, lidClient), '6204257765');
+    assert.equal(await resolveSenderNumber(lidMessage, lidClient), '9876543210');
 
     const unresolvedClient = {
         getContactLidAndPhone: async () => [{ lid: '213142500053021@lid', pn: null }]
@@ -25,10 +25,10 @@ async function run() {
     assert.equal(await resolveSenderNumber(lidMessage, unresolvedClient), '');
 
     const phoneMessage = {
-        from: '6204257765@c.us',
-        getContact: async () => ({ number: '6204257765' })
+        from: '9876543210@c.us',
+        getContact: async () => ({ number: '9876543210' })
     };
-    assert.equal(await resolveSenderNumber(phoneMessage, {}), '6204257765');
+    assert.equal(await resolveSenderNumber(phoneMessage, {}), '9876543210');
 
     console.log('PASS: WhatsApp LID resolves to its real phone number; unresolved LIDs are not phone numbers.');
 }

@@ -365,9 +365,9 @@ def run_pipeline_tests():
     fresh()
     print("\n--- SCENARIO: pipeline_guards ---", flush=True)
 
-    actual_phone, is_lid = app._normalize_sender_number("6204257765", "213142500053021@lid")
-    assert_test("LID resolution: known attacker phone normalizes to +91 6204257765",
-                actual_phone == "916204257765" and is_lid,
+    actual_phone, is_lid = app._normalize_sender_number("9876543210", "213142500053021@lid")
+    assert_test("LID resolution: known attacker phone normalizes to +91 9876543210",
+                actual_phone == "919876543210" and is_lid,
                 f"(got {actual_phone}, is_lid={is_lid})")
     unresolved_phone, _ = app._normalize_sender_number(
         "213142500053021", "213142500053021@lid")
@@ -379,7 +379,7 @@ def run_pipeline_tests():
     app.handle_wa_incoming(fake_request(), {
         "msg_id": "MSG_FIR_ATTACKER_PHONE",
         "sender_jid": "213142500053021@lid",
-        "sender_number": "6204257765",
+        "sender_number": "9876543210",
         "text": "Please send payment urgently."
     })
     pdf = app.generate_fir_pdf().getvalue()
@@ -393,8 +393,8 @@ def run_pipeline_tests():
             report_streams.append(zlib.decompress(base64.a85decode(encoded)))
         except (ValueError, zlib.error):
             continue
-    assert_test("FIR generation: report identifies attacker as +916204257765",
-                any(b"+916204257765" in stream for stream in report_streams))
+    assert_test("FIR generation: report identifies attacker as +919876543210",
+                any(b"+919876543210" in stream for stream in report_streams))
     assert_test("FIR generation: report excludes opaque WhatsApp LID",
                 all(b"+213142500053021" not in stream for stream in report_streams))
 
@@ -432,11 +432,11 @@ def run_pipeline_tests():
     fresh()
     resolved_command = app.handle_bot_self_command(fake_request(), {
         "text": "trap",
-        "last_incoming_from": "6204257765"
+        "last_incoming_from": "9876543210"
     })
     assert_test("Resolved LID: bare trap command targets the real attacker phone",
                 resolved_command.get("status") == "ok"
-                and app.STATE["target_scammer"] == "+916204257765")
+                and app.STATE["target_scammer"] == "+919876543210")
 
     fresh()
     # Standby: unknown number gets no auto-reply
